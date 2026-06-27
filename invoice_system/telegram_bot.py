@@ -774,6 +774,7 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
             await message.reply_text(text)
             return
         selected = set_user_language(settings, user.id, context.args[0])
+        await context.bot.set_my_commands([BotCommand(command, description) for command, description in telegram_command_menu(selected)])
         await message.reply_text("语言已切换为中文。" if selected == LANG_ZH else "Language switched to English.")
 
     async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
