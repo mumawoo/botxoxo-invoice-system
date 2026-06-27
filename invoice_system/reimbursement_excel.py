@@ -110,6 +110,18 @@ class CheckedBuildResult:
 
 
 @dataclass(frozen=True)
+class RerunCheckedResult:
+    archive_dir: Path
+    workbook_path: Path
+    checked_path: Path
+    records_written: int
+    crops_written: int
+    moved: tuple[str, ...]
+    changed: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class ManualChangeResult:
     crop_id: str
     row_idx: int
@@ -118,6 +130,14 @@ class ManualChangeResult:
     after: dict[str, object]
     status: str
     workbook_path: Path
+
+
+@dataclass(frozen=True)
+class _CheckedFinanceRow:
+    number: str
+    sheet_name: str
+    values: list[object]
+    row_idx: int
 
 
 def reimbursement_workbook_path(output_dir: Path) -> Path:
@@ -318,12 +338,293 @@ def build_checked_outputs(output_dir: Path) -> CheckedBuildResult:
     checked_path.parent.mkdir(parents=True, exist_ok=True)
     checked_wb.save(checked_path)
     checked_wb.close()
+    _save_checked_baseline(output_dir)
     return CheckedBuildResult(checked_path, final_dir, len(rows), crops_written, missing)
+
+
+def rerun_checked_from_finance_edits(output_dir: Path) -> RerunCheckedResult:
+    workbook_path = reimbursement_workbook_path(output_dir)
+    checked_path = checked_workbook_path(output_dir)
+    baseline_path = _checked_baseline_workbook_path(output_dir)
+    if not checked_path.exists():
+        raise FileNotFoundError(str(checked_path))
+    if not baseline_path.exists():
+        raise FileNotFoundError(str(baseline_path))
+
+    baseline_rows = _read_checked_finance_rows(baseline_path)
+    current_rows = _read_checked_finance_rows(checked_path)
+    if not baseline_rows:
+        raise ValueError("Baseline checked Excel has no finance rows")
+    if not current_rows:
+        raise ValueError("Current checked Excel has no finance rows")
+    if set(baseline_rows) != set(current_rows):
+        missing = sorted(set(baseline_rows) - set(current_rows))
+        extra = sorted(set(current_rows) - set(baseline_rows))
+        detail = []
+        if missing:
+            detail.append(f"missing checked No.: {', '.join(missing)}")
+        if extra:
+            detail.append(f"extra checked No.: {', '.join(extra)}")
+        raise ValueError("; ".join(detail))
+
+    changed: list[str] = []
+    moved: list[str] = []
+    warnings: list[str] = []
+    for number in sorted(current_rows, key=_checked_number_sort_key):
+        old = baseline_rows[number]
+        new = current_rows[number]
+        if old.sheet_name != new.sheet_name:
+            moved.append(f"{number} {old.sheet_name} -> {new.sheet_name}")
+        elif _checked_row_signature(old.values) != _checked_row_signature(new.values):
+            changed.append(number)
+            warnings.append(f"{number}: finance row values changed")
+    if not moved and not changed:
+        return RerunCheckedResult(output_dir, workbook_path, checked_path, len(current_rows), 0, (), (), ())
+
+    archive_dir = _archive_rerun_inputs(output_dir)
+    _migrate_current_finance_crops_to_review(output_dir, current_rows.values())
+    _write_manual_workbook_from_checked(output_dir, current_rows, baseline_rows)
+    result = build_checked_outputs(output_dir)
+    return RerunCheckedResult(
+        archive_dir,
+        workbook_path,
+        checked_path,
+        result.records_written,
+        result.crops_written,
+        tuple(moved),
+        tuple(changed),
+        tuple(warnings),
+    )
 
 
 def _reorder_row_for_headers(values: list[object], source_headers: list[str], target_headers: list[str]) -> list[object]:
     by_header = {header: values[index] if index < len(values) else None for index, header in enumerate(source_headers)}
     return [by_header.get(header) for header in target_headers]
+
+
+def _checked_baseline_dir(output_dir: Path) -> Path:
+    return output_dir / "checked_baseline"
+
+
+def _checked_baseline_workbook_path(output_dir: Path) -> Path:
+    return _checked_baseline_dir(output_dir) / CHECKED_WORKBOOK_NAME
+
+
+def _save_checked_baseline(output_dir: Path) -> None:
+    baseline_dir = _checked_baseline_dir(output_dir)
+    checked_path = checked_workbook_path(output_dir)
+    final_dir = output_dir / FINAL_CROPS_DIR
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    if checked_path.exists():
+        shutil.copy2(checked_path, baseline_dir / checked_path.name)
+    baseline_crops = baseline_dir / FINAL_CROPS_DIR
+    if baseline_crops.exists():
+        shutil.rmtree(baseline_crops)
+    if final_dir.exists():
+        shutil.copytree(final_dir, baseline_crops)
+
+
+def _read_checked_finance_rows(path: Path) -> dict[str, _CheckedFinanceRow]:
+    wb = load_workbook(path, data_only=False)
+    try:
+        rows: dict[str, _CheckedFinanceRow] = {}
+        for sheet_name in (FOOD_EXP_SHEET, OTHER_EXP_SHEET):
+            if sheet_name not in wb.sheetnames:
+                continue
+            ws = wb[sheet_name]
+            columns = _checked_header_columns(ws)
+            if not columns:
+                continue
+            for row_idx in range(2, ws.max_row + 1):
+                values = _checked_row_values_by_header(ws, row_idx, columns)
+                if not _looks_like_checked_row(values):
+                    continue
+                number = _checked_number(values)
+                if not number:
+                    raise ValueError(f"Missing checked No. in {sheet_name} row {row_idx}")
+                if number in rows:
+                    raise ValueError(f"Duplicate checked No.: {number}")
+                link = str(values[10] or "").strip()
+                if not link:
+                    raise ValueError(f"Missing Invoice link for checked No. {number}")
+                rows[number] = _CheckedFinanceRow(number, sheet_name, values, row_idx)
+        return rows
+    finally:
+        wb.close()
+
+
+def _checked_header_columns(ws) -> dict[str, int]:
+    raw = {str(ws.cell(1, col).value or "").strip(): col for col in range(1, ws.max_column + 1)}
+    return {header: raw[header] for header in CHECKED_HEADERS if header in raw}
+
+
+def _checked_row_values_by_header(ws, row_idx: int, columns: dict[str, int]) -> list[object]:
+    values = [ws.cell(row_idx, columns[header]).value if header in columns else None for header in CHECKED_HEADERS]
+    link_col = columns.get("Invoice link")
+    if link_col:
+        cell = ws.cell(row_idx, link_col)
+        if cell.hyperlink and cell.hyperlink.target:
+            values[CHECKED_HEADERS.index("Invoice link")] = cell.hyperlink.target
+    return values
+
+
+def _looks_like_checked_row(values: list[object]) -> bool:
+    return bool(values and any(value not in (None, "") for value in values) and (values[0] or values[1] or values[2] or values[7]))
+
+
+def _checked_number(values: list[object]) -> str:
+    number = _to_int(values[0])
+    if number:
+        return f"{number:03d}"
+    link_id = _checked_number_from_link(values[10])
+    return link_id
+
+
+def _checked_number_from_link(value: object) -> str:
+    match = re.match(r"(\d{3,})[a-z]?\_", Path(str(value or "")).name)
+    return match.group(1) if match else ""
+
+
+def _checked_number_sort_key(value: str) -> tuple[int, str]:
+    return (_to_int(value) or 0, value)
+
+
+def _checked_row_signature(values: list[object]) -> tuple[object, ...]:
+    return tuple("" if value is None else value for value in values[1:10])
+
+
+def _archive_rerun_inputs(output_dir: Path) -> Path:
+    archive_root = output_dir / "rerun_archive"
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    archive_dir = archive_root / stamp
+    suffix = 1
+    while archive_dir.exists():
+        suffix += 1
+        archive_dir = archive_root / f"{stamp}-{suffix:02d}"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    for path in [
+        reimbursement_workbook_path(output_dir),
+        checked_workbook_path(output_dir),
+        output_dir / "processing_state.json",
+        output_dir / "queue_state.json",
+    ]:
+        if path.exists():
+            shutil.copy2(path, archive_dir / path.name)
+    for folder in [output_dir / FINAL_CROPS_DIR, output_dir / REVIEW_CROPS_DIR, _checked_baseline_dir(output_dir)]:
+        if folder.exists():
+            shutil.copytree(folder, archive_dir / folder.name)
+    return archive_dir
+
+
+def _migrate_current_finance_crops_to_review(output_dir: Path, rows: Iterable[_CheckedFinanceRow]) -> None:
+    review_dir = output_dir / REVIEW_CROPS_DIR
+    review_dir.mkdir(parents=True, exist_ok=True)
+    for row in rows:
+        for source in _finance_crop_sources(output_dir, row):
+            target = review_dir / source.name
+            if not target.exists():
+                shutil.copy2(source, target)
+
+
+def _finance_crop_sources(output_dir: Path, row: _CheckedFinanceRow) -> list[Path]:
+    source = _resolve_crop_source(output_dir, row.values[10])
+    if source is None:
+        raise ValueError(f"Cannot find finance crop for checked No. {row.number}: {row.values[10]}")
+    sources = [source]
+    match = re.match(r"(\d{3,})([a-z])\_", source.name)
+    if match:
+        prefix = match.group(1)
+        for sibling in sorted(source.parent.glob(f"{prefix}[a-z]_*")):
+            if sibling.is_file() and sibling not in sources:
+                sources.append(sibling)
+    return sources
+
+
+def _write_manual_workbook_from_checked(
+    output_dir: Path,
+    current_rows: dict[str, _CheckedFinanceRow],
+    baseline_rows: dict[str, _CheckedFinanceRow],
+) -> None:
+    workbook_path = reimbursement_workbook_path(output_dir)
+    old_rates = _read_existing_exchange_rate_rows(workbook_path)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = INVOICE_EXP_SHEET
+    ws.append(REIMBURSEMENT_HEADERS)
+    crop_links: dict[str, list[str]] = {}
+    for number in sorted(current_rows, key=_checked_number_sort_key):
+        row = current_rows[number]
+        baseline = baseline_rows[number]
+        manual_values = _manual_values_from_checked(output_dir, row, baseline)
+        _append_values_with_link(ws, manual_values)
+        support_links = _supporting_review_links_for_checked(output_dir, row)
+        if support_links:
+            crop_links[Path(str(manual_values[1])).name] = support_links
+    _format_invoice_exp(ws)
+    _autosize(ws, max_col=len(REIMBURSEMENT_HEADERS))
+    _write_exchange_rate_rows(wb, old_rates)
+    _write_crop_links_sheet(wb, crop_links)
+    wb.save(workbook_path)
+    wb.close()
+
+
+def _manual_values_from_checked(output_dir: Path, row: _CheckedFinanceRow, baseline: _CheckedFinanceRow) -> list[object]:
+    values_by_header = {header: row.values[index] if index < len(row.values) else None for index, header in enumerate(CHECKED_HEADERS)}
+    moved = row.sheet_name != baseline.sheet_name
+    category = _rerun_category(row, moved)
+    final_name = Path(str(values_by_header.get("Invoice link") or "")).name
+    return [
+        _to_int(values_by_header.get("No.")) or _to_int(row.number),
+        f"{REVIEW_CROPS_DIR}/{final_name}",
+        values_by_header.get("Date"),
+        values_by_header.get("MXN Amount"),
+        _type_label_zh(category),
+        values_by_header.get("\u539f\u5e01\u79cd"),
+        values_by_header.get("\u539f\u91d1\u989d"),
+        values_by_header.get("\u6c47\u7387"),
+        values_by_header.get("Merchant"),
+        values_by_header.get("Detail"),
+        category,
+        "correct" if moved or _checked_row_signature(row.values) != _checked_row_signature(baseline.values) else "",
+    ]
+
+
+def _rerun_category(row: _CheckedFinanceRow, moved: bool) -> str:
+    current_category = normalize_expense_category(str(row.values[9] or ""))
+    if row.sheet_name == FOOD_EXP_SHEET:
+        return FOOD_EXP_SHEET
+    if moved:
+        return OTHER_EXP_SHEET
+    return OTHER_EXP_SHEET if current_category == FOOD_EXP_SHEET else current_category
+
+
+def _supporting_review_links_for_checked(output_dir: Path, row: _CheckedFinanceRow) -> list[str]:
+    sources = _finance_crop_sources(output_dir, row)
+    return [f"{REVIEW_CROPS_DIR}/{source.name}" for source in sources[1:]]
+
+
+def _read_existing_exchange_rate_rows(workbook_path: Path) -> list[list[object]]:
+    if not workbook_path.exists():
+        return [EXCHANGE_RATE_HEADERS]
+    try:
+        wb = load_workbook(workbook_path, data_only=False)
+    except Exception:
+        return [EXCHANGE_RATE_HEADERS]
+    try:
+        if EXCHANGE_RATE_SHEET not in wb.sheetnames:
+            return [EXCHANGE_RATE_HEADERS]
+        ws = wb[EXCHANGE_RATE_SHEET]
+        rows = [[cell.value for cell in row] for row in ws.iter_rows()]
+        return rows or [EXCHANGE_RATE_HEADERS]
+    finally:
+        wb.close()
+
+
+def _write_exchange_rate_rows(wb, rows: list[list[object]]) -> None:
+    ws = wb.create_sheet(EXCHANGE_RATE_SHEET)
+    for row in rows or [EXCHANGE_RATE_HEADERS]:
+        ws.append(row)
+    _autosize(ws, max_col=max(len(row) for row in rows or [EXCHANGE_RATE_HEADERS]))
 
 
 def focus_reimbursement_workbook(path: Path, target_day: date | None = None) -> int:

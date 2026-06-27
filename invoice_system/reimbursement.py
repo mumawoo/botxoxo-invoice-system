@@ -11,7 +11,7 @@ from openpyxl import Workbook, load_workbook
 from .config import Settings
 from .excel_store import load_invoice_records
 from .queue_worker import telegram_user_output_dir, telegram_user_workbook
-from .reimbursement_excel import REVIEW_CROPS_DIR, build_checked_outputs, checked_workbook_path
+from .reimbursement_excel import REVIEW_CROPS_DIR, build_checked_outputs, checked_workbook_path, rerun_checked_from_finance_edits
 
 REIMBURSEMENT_FILE = "Reimbursement_Status.xlsx"
 ACTIVE_BATCH_FILE = "active_batch_id.txt"
@@ -68,6 +68,10 @@ def sync_reimbursement_records(settings: Settings, user_id: int) -> Path:
 
 def refresh_checked_outputs(settings: Settings, user_id: int):
     return build_checked_outputs(telegram_user_output_dir(settings, user_id))
+
+
+def rerun_finance_edits(settings: Settings, user_id: int):
+    return rerun_checked_from_finance_edits(telegram_user_output_dir(settings, user_id))
 
 
 def unsubmitted_summary(settings: Settings, user_id: int) -> ReimbursementSummary:
@@ -295,7 +299,7 @@ def _reset_active_scan_outputs(settings: Settings, user_id: int) -> None:
         path = output_dir / name
         if path.exists():
             path.unlink()
-    for folder in ("crops", "final_crops", REVIEW_CROPS_DIR):
+    for folder in ("crops", "final_crops", "checked_baseline", REVIEW_CROPS_DIR):
         path = output_dir / folder
         if path.exists():
             shutil.rmtree(path)

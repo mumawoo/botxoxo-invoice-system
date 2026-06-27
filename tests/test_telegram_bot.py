@@ -22,6 +22,7 @@ from invoice_system.telegram_bot import (
     recent_message,
     resolve_auto_process,
     review_crop_paths,
+    rerun_message,
     saved_photo_message,
     scan_completion_message,
     set_user_language,
@@ -164,6 +165,7 @@ class TelegramBotTests(unittest.TestCase):
 
         self.assertIn("change", commands)
         self.assertIn("del", commands)
+        self.assertIn("rerun", commands)
         self.assertIn("submit", commands)
         self.assertIn("edit crop", commands["change"])
 
@@ -346,6 +348,23 @@ class TelegramBotTests(unittest.TestCase):
                 self.assertEqual(ws.cell(3, headers["Manual status"]).value, "delete")
             finally:
                 wb.close()
+
+    def test_rerun_message_reports_missing_checked_baseline(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = Settings(
+                root=root,
+                inbound_dir=root / "data" / "inbound",
+                trial_dir=root / "data" / "trial",
+                output_dir=root / "data" / "output",
+                baseline_dir=root / "data" / "baseline",
+                telegram_allowed_user_ids=frozenset({123}),
+            )
+
+            text = rerun_message(settings, 123)
+
+            self.assertIn("Cannot rerun", text)
+            self.assertIn("/report", text)
 
     def test_telegram_photo_filename_uses_timestamp_and_file_id(self):
         stamp = datetime(2026, 6, 12, 8, 9, 10)

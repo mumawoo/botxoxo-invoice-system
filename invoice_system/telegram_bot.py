@@ -34,6 +34,7 @@ from .reimbursement import (
     format_reimbursement_summary,
     format_submit_result,
     refresh_checked_outputs,
+    rerun_finance_edits,
     submit_unsubmitted,
     submitted_batches_text,
     unsubmitted_summary,
@@ -213,6 +214,7 @@ def telegram_command_menu(lang: str = LANG_EN) -> list[tuple[str, str]]:
             ("excel", "下载当前人工复核 Excel"),
             ("crops", "发送最近 review crop 图片"),
             ("recent", "最近 2 次上传和 Excel 行"),
+            ("rerun", "从修改后的财务 Excel 重建"),
             ("report", "未提交报销汇总"),
             ("restart", "重试失败照片"),
             ("submit", "先预览，再回复 confirm/cancel"),
@@ -227,6 +229,7 @@ def telegram_command_menu(lang: str = LANG_EN) -> list[tuple[str, str]]:
         ("excel", "download current reimbursement Excel"),
         ("crops", "send latest review crop images"),
         ("recent", "last 2 uploads and Excel rows"),
+        ("rerun", "rebuild from edited finance Excel"),
         ("report", "unsubmitted reimbursement summary"),
         ("restart", "retry failed photos"),
         ("submit", "preview, then reply confirm/cancel"),
@@ -477,6 +480,65 @@ def delete_message(settings: Settings, user_id: int, args: list[str], lang: str 
     else:
         lines.append(f"{'数量' if is_zh(lang) else 'Count'}: {len(results)}")
     lines.append(f"{'Checked 行/crops' if is_zh(lang) else 'Checked rows/crops'}: {checked.records_written}/{checked.crops_written}")
+    return "\n".join(lines)
+
+
+def rerun_message(settings: Settings, user_id: int, lang: str = LANG_EN) -> str:
+    try:
+        result = rerun_finance_edits(settings, user_id)
+    except FileNotFoundError as exc:
+        missing = Path(str(exc).strip() or "").name or "checked/baseline"
+        if is_zh(lang):
+            return f"无法 rerun：缺少 {missing}。\n请先用 /report 生成财务 Excel，然后修改财务 Excel 后再发 /rerun。"
+        return f"Cannot rerun: missing {missing}.\nUse /report to generate the finance Excel, edit it, then send /rerun."
+    except PermissionError:
+        if is_zh(lang):
+            return "Excel 已打开/锁定。请关闭财务 Excel 后重新发送 /rerun。"
+        return "Excel is open/locked. Close the finance Excel and resend /rerun."
+    except OSError as exc:
+        if is_zh(lang):
+            return f"Excel 已打开/锁定或不可用。请关闭后重新发送 /rerun。\n{exc}"
+        return f"Excel is open/locked or unavailable. Close it and resend /rerun.\n{exc}"
+    except ValueError as exc:
+        if is_zh(lang):
+            return f"无法 rerun：{exc}"
+        return f"Cannot rerun: {exc}"
+    if not result.moved and not result.changed:
+        if is_zh(lang):
+            return "Rerun：没有发现财务 Excel 和 baseline 的差异。未重建文件。"
+        return "Rerun: no differences found between the finance Excel and baseline. Nothing rebuilt."
+    if is_zh(lang):
+        lines = [
+            "Rerun 完成",
+            f"Checked 行/crops: {result.records_written}/{result.crops_written}",
+            f"归档: {result.archive_dir}",
+        ]
+        if result.moved:
+            lines.append("移动:")
+            lines.extend(f"- {item}" for item in result.moved)
+        if result.changed:
+            lines.append("财务行内容变化:")
+            lines.extend(f"- {item}" for item in result.changed)
+        if result.warnings:
+            lines.append("警告:")
+            lines.extend(f"- {item}" for item in result.warnings[:5])
+        lines.append("新的人工表、checked Excel 和 final_crops 已重建。/change 和 /del 仍可继续使用。")
+        return "\n".join(lines)
+    lines = [
+        "Rerun complete",
+        f"Checked rows/crops: {result.records_written}/{result.crops_written}",
+        f"Archive: {result.archive_dir}",
+    ]
+    if result.moved:
+        lines.append("Moved:")
+        lines.extend(f"- {item}" for item in result.moved)
+    if result.changed:
+        lines.append("Finance row value changes:")
+        lines.extend(f"- {item}" for item in result.changed)
+    if result.warnings:
+        lines.append("Warnings:")
+        lines.extend(f"- {item}" for item in result.warnings[:5])
+    lines.append("New manual workbook, checked Excel, and final_crops were rebuilt. /change and /del still work.")
     return "\n".join(lines)
 
 
@@ -819,6 +881,15 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
             return
         await message.reply_text(delete_message(settings, user.id, list(context.args or []), user_language(settings, user.id)))
 
+    async def rerun(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await reply_not_allowed(update):
+            return
+        message = update.effective_message
+        user = update.effective_user
+        if message is None or user is None:
+            return
+        await message.reply_text(rerun_message(settings, user.id, user_language(settings, user.id)))
+
     async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
         user = update.effective_user
@@ -864,6 +935,7 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
     app.add_handler(CommandHandler("crops", crops))
     app.add_handler(CommandHandler("change", change))
     app.add_handler(CommandHandler("del", delete_crop))
+    app.add_handler(CommandHandler("rerun", rerun))
     app.add_handler(CommandHandler("today_excel", excel))
     app.add_handler(CommandHandler("report", report))
     app.add_handler(CommandHandler("recent", recent))

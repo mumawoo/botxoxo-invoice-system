@@ -22,6 +22,7 @@ from invoice_system.reimbursement_excel import (
     corrected_crop_names,
     focus_reimbursement_workbook,
     load_reimbursement_records,
+    rerun_checked_from_finance_edits,
 )
 
 
@@ -533,6 +534,56 @@ class ReimbursementExcelTests(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_rerun_rebuilds_manual_workbook_from_edited_checked_finance_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / REIMBURSEMENT_WORKBOOK_NAME
+            review = root / "review_crops"
+            review.mkdir()
+            food_crop = review / "001_2026-06-12_MXN_100.00_Cafe.jpg"
+            other_crop = review / "002_2026-06-13_MXN_200.00_Pemex.jpg"
+            food_crop.write_bytes(b"food")
+            other_crop.write_bytes(b"other")
+            ReimbursementWorkbook(path).write_records(
+                [
+                    InvoiceRecord(line_no=1, invoice_date="2026-06-12", expense_category="Food", total_amount=100, seller="Cafe", crop_image=str(food_crop)),
+                    InvoiceRecord(line_no=2, invoice_date="2026-06-13", expense_category="Gas", total_amount=200, seller="Pemex", crop_image=str(other_crop)),
+                ]
+            )
+            build_checked_outputs(root)
+            _move_checked_row(root / CHECKED_WORKBOOK_NAME, FOOD_EXP_SHEET, OTHER_EXP_SHEET, 2)
+
+            result = rerun_checked_from_finance_edits(root)
+
+            self.assertTrue(result.archive_dir.exists())
+            self.assertEqual(result.moved, ("001 Food -> Other",))
+            wb = load_workbook(path, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                self.assertEqual(ws.cell(2, 11).value, "Other")
+                self.assertEqual(ws.cell(2, 12).value, "correct")
+            finally:
+                wb.close()
+            checked = load_workbook(root / CHECKED_WORKBOOK_NAME, data_only=True)
+            try:
+                self.assertEqual(checked[FOOD_EXP_SHEET].max_row, 1)
+                self.assertEqual(checked[OTHER_EXP_SHEET].cell(3, 1).value, 2)
+                self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, 11).value, "final_crops/other/001_2026-06-12_MXN_100.00_Cafe.jpg")
+            finally:
+                checked.close()
+            self.assertTrue((root / "final_crops" / "other" / "001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
+
+            _move_checked_row(root / CHECKED_WORKBOOK_NAME, OTHER_EXP_SHEET, FOOD_EXP_SHEET, 2)
+            second = rerun_checked_from_finance_edits(root)
+
+            self.assertEqual(second.moved, ("001 Other -> Food",))
+            checked = load_workbook(root / CHECKED_WORKBOOK_NAME, data_only=True)
+            try:
+                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, 1).value, 1)
+                self.assertTrue((root / "final_crops" / "food" / "001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
+            finally:
+                checked.close()
+
     def test_corrected_row_is_preserved_and_new_rows_skip_locked_number(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -621,6 +672,25 @@ class ReimbursementExcelTests(unittest.TestCase):
                 self.assertEqual(ws.sheet_view.selection[0].activeCell, "A3")
             finally:
                 wb.close()
+
+
+def _move_checked_row(path: Path, source_sheet: str, target_sheet: str, source_row: int) -> None:
+    wb = load_workbook(path)
+    try:
+        source = wb[source_sheet]
+        target = wb[target_sheet]
+        values = [source.cell(source_row, col).value for col in range(1, source.max_column + 1)]
+        hyperlinks = [source.cell(source_row, col).hyperlink.target if source.cell(source_row, col).hyperlink else None for col in range(1, source.max_column + 1)]
+        target.append(values)
+        target_row = target.max_row
+        for col, hyperlink in enumerate(hyperlinks, start=1):
+            if hyperlink:
+                target.cell(target_row, col).hyperlink = hyperlink
+                target.cell(target_row, col).style = "Hyperlink"
+        source.delete_rows(source_row, 1)
+        wb.save(path)
+    finally:
+        wb.close()
 
 
 if __name__ == "__main__":
