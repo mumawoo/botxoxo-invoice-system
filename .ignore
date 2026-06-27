@@ -1,0 +1,11 @@
+# Keep search output focused on source files.
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+data/*
+!data/samples/
+!data/samples/synthetic_receipt.jpg
+~$*
+*.log

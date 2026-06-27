@@ -1,0 +1,25 @@
+# Local secrets
+.env
+
+# Python cache/test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Runtime data from real invoice processing. Keep only reusable samples.
+data/*
+!data/samples/
+!data/samples/synthetic_receipt.jpg
+
+# Real reimbursement workbooks/archives generated during operations
+*.xlsx
+*.xls
+*.xlsm
+*.zip
+
+# Office temporary lock files
+~$*
+
+# Logs
+*.log
