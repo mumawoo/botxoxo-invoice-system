@@ -24,6 +24,7 @@ from invoice_system.telegram_bot import (
     review_crop_paths,
     saved_photo_message,
     scan_completion_message,
+    set_user_language,
     submit_confirmation_message,
     submit_message,
     submit_pending_confirmation,
@@ -34,6 +35,7 @@ from invoice_system.telegram_bot import (
     telegram_photo_filename,
     telegram_polling_ready,
     telegram_start_message,
+    user_language,
     whoami_message,
 )
 
@@ -143,6 +145,19 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn("/del", text)
         self.assertNotIn("/today_excel -", text)
         self.assertIn("/submit", text)
+
+    def test_chinese_help_and_language_preference(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = Settings(root=Path(temp), output_dir=Path(temp) / "out", telegram_language="en")
+
+            self.assertEqual(user_language(settings, 123), "en")
+            self.assertEqual(set_user_language(settings, 123, "zh"), "zh")
+            self.assertEqual(user_language(settings, 123), "zh")
+
+        text = telegram_help_message("zh")
+        self.assertIn("命令", text)
+        self.assertIn("/lang", text)
+        self.assertIn("切换语言", text)
 
     def test_telegram_command_menu_lists_popup_commands(self):
         commands = dict(telegram_command_menu())

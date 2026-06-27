@@ -83,6 +83,7 @@ class Settings:
     telegram_bot_token: str | None = None
     telegram_allowed_user_ids: frozenset[int] = frozenset()
     telegram_auto_process: bool = False
+    telegram_language: str = "en"
     ai_visual_count_enabled: bool = False
     ai_visual_count_min_opencv_crops: int = 4
     pairing_mode: str = "auto"
@@ -115,6 +116,7 @@ class Settings:
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN"),
             telegram_allowed_user_ids=frozenset(allowed),
             telegram_auto_process=parse_bool(os.getenv("TELEGRAM_AUTO_PROCESS"), False),
+            telegram_language=parse_choice(os.getenv("TELEGRAM_LANGUAGE"), "en", {"en", "zh"}),
             ai_visual_count_enabled=parse_bool(os.getenv("ENABLE_AI_VISUAL_COUNT"), False),
             ai_visual_count_min_opencv_crops=parse_int(os.getenv("AI_VISUAL_COUNT_MIN_OPENCV_CROPS"), 4),
             pairing_mode=parse_choice(os.getenv("PAIRING_MODE"), "auto", {"auto", "review"}),
