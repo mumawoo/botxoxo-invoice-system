@@ -392,6 +392,8 @@ def recent_message(settings: Settings, user_id: int, limit: int = 2, lang: str =
 
 
 def change_message(settings: Settings, user_id: int, args: list[str], lang: str = LANG_EN) -> str:
+    if not args:
+        return _change_usage_message(lang)
     output_dir = telegram_user_output_dir(settings, user_id)
     try:
         parsed = _parse_change_args(args)
@@ -446,9 +448,7 @@ def change_message(settings: Settings, user_id: int, args: list[str], lang: str 
 def delete_message(settings: Settings, user_id: int, args: list[str], lang: str = LANG_EN) -> str:
     crop_ids = _delete_crop_ids(args)
     if not crop_ids:
-        if is_zh(lang):
-            return "缺少 crop id\n用法: /del 021 或 /del 021 022"
-        return "Missing crop id\nUsage: /del 021 or /del 021 022"
+        return _delete_usage_message(lang)
     output_dir = telegram_user_output_dir(settings, user_id)
     try:
         results = [change_reimbursement_record(output_dir, crop_id, status="delete") for crop_id in crop_ids]
@@ -553,6 +553,36 @@ def _delete_crop_ids(args: list[str]) -> list[str]:
             crop_ids.append(crop_id)
             seen.add(crop_id)
     return crop_ids
+
+
+def _change_usage_message(lang: str = LANG_EN) -> str:
+    if is_zh(lang):
+        return "\n".join(
+            [
+                "修改 crop /change",
+                "用法:",
+                "/change 021 type Other",
+                "/change 021 amount 33.35 currency USD",
+                "/change 021 + 备注文字",
+                "删除请用: /del 021",
+            ]
+        )
+    return "\n".join(
+        [
+            "Change crop /change",
+            "Usage:",
+            "/change 021 type Other",
+            "/change 021 amount 33.35 currency USD",
+            "/change 021 + note text",
+            "Use /del 021 to delete.",
+        ]
+    )
+
+
+def _delete_usage_message(lang: str = LANG_EN) -> str:
+    if is_zh(lang):
+        return "\n".join(["删除 crop /del", "用法:", "/del 021", "/del 021 022"])
+    return "\n".join(["Delete crop /del", "Usage:", "/del 021", "/del 021 022"])
 
 
 def review_crop_paths(settings: Settings, user_id: int) -> list[Path]:
@@ -691,7 +721,7 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
     try:
-        from telegram import BotCommand, Update
+        from telegram import BotCommand, MenuButtonCommands, Update
         from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
     except ImportError as exc:
         raise RuntimeError("Install python-telegram-bot to use Telegram ingestion") from exc
@@ -700,6 +730,7 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
 
     async def post_init(application: Application) -> None:
         await application.bot.set_my_commands([BotCommand(command, description) for command, description in telegram_command_menu(user_language(settings))])
+        await application.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
 
     async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if update.effective_message:

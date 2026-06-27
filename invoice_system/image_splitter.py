@@ -248,9 +248,11 @@ def _normalize_crop(crop, cv2):
 
 def _orient_text_upright(crop, cv2):
     rotation = _tesseract_rotation(crop, cv2)
-    if rotation in {90, 180, 270}:
+    if rotation in {90, 270}:
         return _rotate_degrees(crop, rotation, cv2)
     ocr_rotation = _tesseract_ocr_rotation(crop, cv2)
+    if rotation == 180 and ocr_rotation != 180:
+        return crop
     if ocr_rotation == 180:
         return _rotate_degrees(crop, 180, cv2)
     return crop

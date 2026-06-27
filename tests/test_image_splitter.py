@@ -128,6 +128,34 @@ class ImageSplitterTests(unittest.TestCase):
 
         self.assertTrue(np.array_equal(normalized, crop))
 
+    def test_orient_text_ignores_osd_180_without_ocr_confirmation(self):
+        import cv2
+        import numpy as np
+
+        crop = np.full((900, 450, 3), 255, dtype=np.uint8)
+        cv2.putText(crop, "TOTAL 123.45", (35, 90), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 3)
+
+        with patch("invoice_system.image_splitter._tesseract_rotation", return_value=180), patch(
+            "invoice_system.image_splitter._tesseract_ocr_rotation", return_value=None
+        ):
+            normalized = _orient_text_upright(crop, cv2)
+
+        self.assertTrue(np.array_equal(normalized, crop))
+
+    def test_orient_text_flips_180_when_osd_and_ocr_agree(self):
+        import cv2
+        import numpy as np
+
+        crop = np.full((900, 450, 3), 255, dtype=np.uint8)
+        crop[0, 0] = (0, 0, 255)
+
+        with patch("invoice_system.image_splitter._tesseract_rotation", return_value=180), patch(
+            "invoice_system.image_splitter._tesseract_ocr_rotation", return_value=180
+        ):
+            normalized = _orient_text_upright(crop, cv2)
+
+        self.assertTrue(np.array_equal(normalized[-1, -1], (0, 0, 255)))
+
     def test_ocr_orientation_score_prefers_confident_receipt_words(self):
         header = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n"
         good = header + "\n".join(

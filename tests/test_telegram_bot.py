@@ -169,6 +169,19 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn("submit", commands)
         self.assertIn("edit crop", commands["change"])
 
+    def test_empty_change_message_shows_mobile_template(self):
+        text = change_message(Settings(), 123, [])
+
+        self.assertIn("/change 021 type Other", text)
+        self.assertIn("/change 021 amount 33.35 currency USD", text)
+        self.assertIn("/del 021", text)
+
+    def test_empty_del_message_shows_mobile_template(self):
+        text = delete_message(Settings(), 123, [])
+
+        self.assertIn("/del 021", text)
+        self.assertIn("/del 021 022", text)
+
     def test_processing_success_message(self):
         summary = PipelineSummary(
             source_images=1,
