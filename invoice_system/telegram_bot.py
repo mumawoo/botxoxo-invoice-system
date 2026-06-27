@@ -373,15 +373,16 @@ def recent_message(settings: Settings, user_id: int, limit: int = 2, lang: str =
             status = str(row.get("Manual status") or "active")
             no = _format_excel_no(row.get("No."))
             excel_row = row.get("_row")
+            excel_sheet = row.get("_sheet") or "Excel"
             category = str(row.get("Accounting Category") or row.get("Type") or "Other")
             currency = str(row.get("\u539f\u5e01\u79cd") or "MXN")
             amount = float(row.get("\u539f\u91d1\u989d") or row.get("MXN Amount") or 0)
             merchant = str(row.get("Merchant") or "Unknown")
             combined = " | 合并为一行" if is_zh(lang) and len(crop_ids) > 1 else " | combined one row" if len(crop_ids) > 1 else ""
             if is_zh(lang):
-                lines.append(f"- {label} -> Excel 行 {excel_row}, No. {no} | {category} {currency} {amount:.2f} | {merchant} | {status}{combined}")
+                lines.append(f"- {label} -> {excel_sheet} 行 {excel_row}, No. {no} | {category} {currency} {amount:.2f} | {merchant} | {status}{combined}")
             else:
-                lines.append(f"- {label} -> Excel row {excel_row}, No. {no} | {category} {currency} {amount:.2f} | {merchant} | {status}{combined}")
+                lines.append(f"- {label} -> {excel_sheet} row {excel_row}, No. {no} | {category} {currency} {amount:.2f} | {merchant} | {status}{combined}")
     return "\n".join(lines)
 
 
@@ -1096,21 +1097,26 @@ def _excel_rows_by_crop_id(workbook: Path) -> dict[str, dict[str, object]]:
     except Exception:
         return {}
     try:
-        if INVOICE_EXP_SHEET not in wb.sheetnames:
-            return {}
-        ws = wb[INVOICE_EXP_SHEET]
-        headers = {str(ws.cell(1, col).value or ""): col for col in range(1, ws.max_column + 1)}
-        link_col = headers.get("Invoice link", 2)
         rows: dict[str, dict[str, object]] = {}
-        for row_idx in range(2, ws.max_row + 1):
-            link_cell = ws.cell(row_idx, link_col)
-            link = str(link_cell.hyperlink.target if link_cell.hyperlink else link_cell.value or "")
-            crop_id = _crop_id_from_path_text(link)
-            if not crop_id:
+        active_names = {"Food", "Other"}
+        worksheets = [ws for ws in wb.worksheets if ws.title in active_names]
+        if not worksheets:
+            worksheets = [ws for ws in wb.worksheets if ws.title == INVOICE_EXP_SHEET or ws.sheet_state == "visible"]
+        for ws in worksheets:
+            headers = {str(ws.cell(1, col).value or ""): col for col in range(1, ws.max_column + 1)}
+            if "Invoice link" not in headers or "MXN Amount" not in headers:
                 continue
-            row = {header: ws.cell(row_idx, col).value for header, col in headers.items() if header}
-            row["_row"] = row_idx
-            rows[crop_id] = row
+            link_col = headers.get("Invoice link", 2)
+            for row_idx in range(2, ws.max_row + 1):
+                link_cell = ws.cell(row_idx, link_col)
+                link = str(link_cell.hyperlink.target if link_cell.hyperlink else link_cell.value or "")
+                crop_id = _crop_id_from_path_text(link)
+                if not crop_id:
+                    continue
+                row = {header: ws.cell(row_idx, col).value for header, col in headers.items() if header}
+                row["_row"] = row_idx
+                row["_sheet"] = ws.title
+                rows[crop_id] = row
         return rows
     finally:
         wb.close()

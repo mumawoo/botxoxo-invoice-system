@@ -10,7 +10,9 @@ from invoice_system.fx_rates import ExchangeRate
 from invoice_system.models import InvoiceRecord
 from invoice_system.reimbursement_excel import (
     CHECKED_WORKBOOK_NAME,
+    FOOD_EXP_SHEET,
     INVOICE_EXP_SHEET,
+    OTHER_EXP_SHEET,
     REIMBURSEMENT_WORKBOOK_NAME,
     ReimbursementWorkbook,
     assign_available_line_numbers,
@@ -60,6 +62,30 @@ class ReimbursementExcelTests(unittest.TestCase):
                 self.assertEqual(rates.cell(1, 25).value, "MXN")
                 self.assertEqual(rates.cell(2, 2).value, 700)
                 self.assertEqual(rates.cell(2, 25).value, 250)
+            finally:
+                wb.close()
+
+    def test_reimbursement_workbook_splits_food_and_other_sheets(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / REIMBURSEMENT_WORKBOOK_NAME
+            store = ReimbursementWorkbook(path)
+
+            store.write_records(
+                [
+                    InvoiceRecord(line_no=1, invoice_date="2026-06-12", expense_category="Food", total_amount=100, seller="Cafe"),
+                    InvoiceRecord(line_no=2, invoice_date="2026-06-13", expense_category="Gas", total_amount=200, seller="Pemex"),
+                ]
+            )
+
+            wb = load_workbook(path, data_only=True)
+            try:
+                self.assertIn(FOOD_EXP_SHEET, wb.sheetnames)
+                self.assertIn(OTHER_EXP_SHEET, wb.sheetnames)
+                self.assertEqual(wb[FOOD_EXP_SHEET].cell(2, 9).value, "Cafe")
+                self.assertEqual(wb[OTHER_EXP_SHEET].cell(2, 9).value, "Pemex")
+                self.assertEqual(wb[INVOICE_EXP_SHEET].sheet_state, "hidden")
+                self.assertEqual(wb[INVOICE_EXP_SHEET].cell(2, 9).value, "Cafe")
+                self.assertEqual(wb[INVOICE_EXP_SHEET].cell(3, 9).value, "Pemex")
             finally:
                 wb.close()
 
@@ -579,10 +605,10 @@ class ReimbursementExcelTests(unittest.TestCase):
 
             wb = load_workbook(path)
             try:
-                ws = wb[INVOICE_EXP_SHEET]
-                self.assertEqual(row, 3)
-                self.assertEqual(wb.active.title, INVOICE_EXP_SHEET)
-                self.assertEqual(ws.sheet_view.selection[0].activeCell, "A3")
+                ws = wb[OTHER_EXP_SHEET]
+                self.assertEqual(row, 2)
+                self.assertEqual(wb.active.title, OTHER_EXP_SHEET)
+                self.assertEqual(ws.sheet_view.selection[0].activeCell, "A2")
             finally:
                 wb.close()
 

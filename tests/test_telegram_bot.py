@@ -9,7 +9,7 @@ from openpyxl import load_workbook
 from invoice_system.config import Settings
 from invoice_system.models import InvoiceRecord, PipelineSummary
 from invoice_system.queue_worker import DONE, QueueItem, save_queue_state, telegram_user_queue_path, telegram_user_workbook, QueueState
-from invoice_system.reimbursement_excel import INVOICE_EXP_SHEET, ReimbursementWorkbook
+from invoice_system.reimbursement_excel import INVOICE_EXP_SHEET, OTHER_EXP_SHEET, ReimbursementWorkbook
 from invoice_system.telegram_bot import (
     append_process_status,
     change_message,
@@ -551,8 +551,8 @@ class TelegramBotTests(unittest.TestCase):
             )
             wb = load_workbook(telegram_user_workbook(settings, 123))
             try:
-                ws = wb[INVOICE_EXP_SHEET]
-                ws.cell(4, 12).value = "delete"
+                ws = wb[OTHER_EXP_SHEET]
+                ws.cell(2, 12).value = "delete"
                 wb.save(telegram_user_workbook(settings, 123))
             finally:
                 wb.close()
@@ -573,11 +573,11 @@ class TelegramBotTests(unittest.TestCase):
 
             self.assertIn("Recent uploads", text)
             self.assertIn("Input 1: done | Excel rows 2 | crops 2", text)
-            self.assertIn("040 -> Excel row 3, No. 040", text)
-            self.assertIn("041 -> Excel row 4, No. 041", text)
+            self.assertIn("040 -> Food row 3, No. 040", text)
+            self.assertIn("041 -> Other row 2, No. 041", text)
             self.assertIn("| delete", text)
             self.assertIn("Input 2: done | Excel rows 1 | crops 1", text)
-            self.assertIn("039 -> Excel row 2, No. 039", text)
+            self.assertIn("039 -> Food row 2, No. 039", text)
 
     def test_submit_message_requires_confirmation(self):
         with tempfile.TemporaryDirectory() as temp:
