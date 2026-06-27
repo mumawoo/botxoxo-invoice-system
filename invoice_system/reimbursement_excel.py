@@ -285,14 +285,15 @@ def build_checked_outputs(output_dir: Path) -> CheckedBuildResult:
         output += [None] * (len(REIMBURSEMENT_HEADERS) - len(output))
         output[0] = index
         sources = crop_sources[index - 1]
+        final_subdir = _final_crop_subdir(row_sheets[index - 1])
         for source_index, source in enumerate(sources):
             suffix = _combined_crop_suffix(source_index, len(sources))
-            target = final_dir / _checked_crop_name(index, output, suffix)
+            target = final_dir / final_subdir / _checked_crop_name(index, output, suffix)
             target.parent.mkdir(parents=True, exist_ok=True)
             if source.resolve() != target.resolve():
                 shutil.copy2(source, target)
             if source_index == 0:
-                output[1] = f"{FINAL_CROPS_DIR}/{target.name}"
+                output[1] = f"{FINAL_CROPS_DIR}/{final_subdir}/{target.name}"
             crops_written += 1
         checked_output = _reorder_row_for_headers(output, REIMBURSEMENT_HEADERS, CHECKED_HEADERS)
         checked_ws = checked_sheets.get(row_sheets[index - 1], checked_other_ws)
@@ -526,13 +527,17 @@ def clear_generated_crops(final_dir: Path, preserve_names: set[str] | None = Non
     if not final_dir.exists():
         final_dir.mkdir(parents=True, exist_ok=True)
         return
-    for path in final_dir.iterdir():
+    for path in final_dir.rglob("*"):
+        if path.is_dir():
+            continue
         if path.name in preserve_names:
             continue
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
+        path.unlink()
+    for path in sorted((item for item in final_dir.rglob("*") if item.is_dir()), key=lambda item: len(item.parts), reverse=True):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
 
 
 def _migrate_final_crops_to_review(output_dir: Path) -> None:
@@ -542,7 +547,7 @@ def _migrate_final_crops_to_review(output_dir: Path) -> None:
         review_dir.mkdir(parents=True, exist_ok=True)
         return
     review_dir.mkdir(parents=True, exist_ok=True)
-    for path in final_dir.iterdir():
+    for path in final_dir.rglob("*"):
         if not path.is_file():
             continue
         target = review_dir / path.name
@@ -562,6 +567,8 @@ def _resolve_crop_source(output_dir: Path, link_value: object) -> Path | None:
         candidates.append(output_dir / REVIEW_CROPS_DIR / path.name)
         candidates.append(output_dir / path)
         candidates.append(output_dir / FINAL_CROPS_DIR / path.name)
+        candidates.append(output_dir / FINAL_CROPS_DIR / "food" / path.name)
+        candidates.append(output_dir / FINAL_CROPS_DIR / "other" / path.name)
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -769,6 +776,10 @@ def _checked_crop_name(line_no: int, values: list[object], suffix: str = "") -> 
     amount = _to_float(values[6]) if original_currency != "MXN" else _to_float(values[3])
     seller = _safe_filename_part(str(values[8] or "Unknown"))[:80]
     return f"{line_no:03d}{suffix}_{invoice_date}_{original_currency}_{amount:.2f}_{seller}.jpg"
+
+
+def _final_crop_subdir(sheet_name: str) -> str:
+    return "food" if sheet_name == FOOD_EXP_SHEET else "other"
 
 
 def _combined_crop_suffix(index: int, total: int) -> str:

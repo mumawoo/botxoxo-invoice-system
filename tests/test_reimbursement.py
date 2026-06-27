@@ -43,7 +43,8 @@ class ReimbursementTests(unittest.TestCase):
             self.assertEqual(result.record_count, 2)
             self.assertTrue(result.archived_excel.exists())
             self.assertEqual(result.archived_excel.name, CHECKED_WORKBOOK_NAME)
-            self.assertTrue((result.archived_crops / "001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
+            self.assertTrue((result.archived_crops / "food" / "001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
+            self.assertTrue((result.archived_crops / "other" / "002_2026-06-13_MXN_200.00_Pemex.jpg").exists())
             self.assertTrue(result.archived_manual_excel.exists())
             self.assertTrue((result.archived_review_crops / "001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
             self.assertFalse(telegram_user_workbook(settings, 123).exists())
@@ -81,11 +82,13 @@ def _write_reimbursement_workbook(settings: Settings, user_id: int) -> None:
     output_dir = telegram_user_output_dir(settings, user_id)
     workbook = telegram_user_workbook(settings, user_id)
     crop = output_dir / "review_crops" / "001_2026-06-12_MXN_100.00_Cafe.jpg"
+    crop2 = output_dir / "review_crops" / "002_2026-06-13_MXN_200.00_Pemex.jpg"
     crop.parent.mkdir(parents=True, exist_ok=True)
     crop.write_bytes(b"jpg")
+    crop2.write_bytes(b"jpg")
     records = [
         InvoiceRecord(line_no=1, invoice_date="2026-06-12", seller="Cafe", expense_category="Food", total_amount=100, crop_image=str(crop)),
-        InvoiceRecord(line_no=2, invoice_date="2026-06-13", seller="Pemex", expense_category="Gas", total_amount=200),
+        InvoiceRecord(line_no=2, invoice_date="2026-06-13", seller="Pemex", expense_category="Gas", total_amount=200, crop_image=str(crop2)),
     ]
     ReimbursementWorkbook(workbook).write_records(records)
     (output_dir / "processing_state.json").write_text("{}", encoding="utf-8")

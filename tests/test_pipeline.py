@@ -169,14 +169,14 @@ class PipelineHelperTests(unittest.TestCase):
             try:
                 checked_ws = checked_wb[INVOICE_EXP_SHEET]
                 self.assertEqual(checked_ws.cell(1, checked_ws.max_column).value, "Invoice link")
-                self.assertEqual(checked_ws.cell(2, checked_ws.max_column).value, "final_crops/001_2026-06-12_MXN_116.00_CAFE_XUAN.jpg")
+                self.assertEqual(checked_ws.cell(2, checked_ws.max_column).value, "final_crops/food/001_2026-06-12_MXN_116.00_CAFE_XUAN.jpg")
             finally:
                 checked_wb.close()
 
-            final_crops = sorted((output / "final_crops").glob("*.jpg"))
+            final_crops = sorted((output / "final_crops").rglob("*.jpg"))
             self.assertEqual(len(final_crops), 2)
-            self.assertEqual(final_crops[0].name, "001_2026-06-12_MXN_116.00_CAFE_XUAN.jpg")
-            self.assertEqual(final_crops[1].name, "002_2026-06-13_MXN_92.80_PANADERIA_LUZ.jpg")
+            self.assertEqual(final_crops[0].relative_to(output / "final_crops").as_posix(), "food/001_2026-06-12_MXN_116.00_CAFE_XUAN.jpg")
+            self.assertEqual(final_crops[1].relative_to(output / "final_crops").as_posix(), "food/002_2026-06-13_MXN_92.80_PANADERIA_LUZ.jpg")
 
     def test_process_path_removes_stale_raw_crops_before_run(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -419,6 +419,7 @@ class FakeResolver:
                 seller="CAFE XUAN",
                 currency="MXN",
                 total_amount=116,
+                expense_category="Food",
                 expense_amount=100,
                 vat_amount=16,
             ),
@@ -427,6 +428,7 @@ class FakeResolver:
                 seller="PANADERIA LUZ",
                 currency="MXN",
                 total_amount=92.8,
+                expense_category="Food",
                 expense_amount=80,
                 vat_amount=12.8,
             ),

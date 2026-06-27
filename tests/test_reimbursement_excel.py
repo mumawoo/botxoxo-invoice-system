@@ -276,14 +276,19 @@ class ReimbursementExcelTests(unittest.TestCase):
             self.assertEqual(result.records_written, 2)
             self.assertEqual(result.crops_written, 2)
             self.assertEqual(result.workbook_path.name, CHECKED_WORKBOOK_NAME)
-            final_crops = sorted((root / "final_crops").glob("*.jpg"))
-            self.assertEqual([path.name for path in final_crops], ["001_2026-06-12_MXN_100.00_Cafe.jpg", "002_2026-06-14_MXN_50.00_Store.jpg"])
+            final_crops = sorted((root / "final_crops").rglob("*.jpg"))
+            self.assertEqual(
+                [path.relative_to(root / "final_crops").as_posix() for path in final_crops],
+                ["food/001_2026-06-12_MXN_100.00_Cafe.jpg", "other/002_2026-06-14_MXN_50.00_Store.jpg"],
+            )
             checked = load_workbook(root / CHECKED_WORKBOOK_NAME, data_only=True)
             try:
                 self.assertIn(FOOD_EXP_SHEET, checked.sheetnames)
                 self.assertIn(OTHER_EXP_SHEET, checked.sheetnames)
                 self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, 8).value, "Cafe")
                 self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, 8).value, "Store")
+                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, 11).value, "final_crops/food/001_2026-06-12_MXN_100.00_Cafe.jpg")
+                self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, 11).value, "final_crops/other/002_2026-06-14_MXN_50.00_Store.jpg")
                 ws = checked[INVOICE_EXP_SHEET]
                 self.assertEqual(ws.max_row, 3)
                 self.assertEqual(ws.cell(1, 2).value, "Date")
@@ -291,8 +296,8 @@ class ReimbursementExcelTests(unittest.TestCase):
                 self.assertEqual(ws.cell(2, 1).value, 1)
                 self.assertEqual(ws.cell(3, 1).value, 2)
                 self.assertEqual(ws.cell(3, 8).value, "Store")
-                self.assertEqual(ws.cell(3, 11).value, "final_crops/002_2026-06-14_MXN_50.00_Store.jpg")
-                self.assertEqual(ws.cell(3, 11).hyperlink.target, "final_crops/002_2026-06-14_MXN_50.00_Store.jpg")
+                self.assertEqual(ws.cell(3, 11).value, "final_crops/other/002_2026-06-14_MXN_50.00_Store.jpg")
+                self.assertEqual(ws.cell(3, 11).hyperlink.target, "final_crops/other/002_2026-06-14_MXN_50.00_Store.jpg")
             finally:
                 checked.close()
 
@@ -324,19 +329,19 @@ class ReimbursementExcelTests(unittest.TestCase):
 
             self.assertEqual(result.records_written, 1)
             self.assertEqual(result.crops_written, 2)
-            final_crops = sorted((root / "final_crops").glob("*.jpg"))
+            final_crops = sorted((root / "final_crops").rglob("*.jpg"))
             self.assertEqual(
-                [path.name for path in final_crops],
+                [path.relative_to(root / "final_crops").as_posix() for path in final_crops],
                 [
-                    "001a_2026-06-12_MXN_126.00_Cafe.jpg",
-                    "001b_2026-06-12_MXN_126.00_Cafe.jpg",
+                    "food/001a_2026-06-12_MXN_126.00_Cafe.jpg",
+                    "food/001b_2026-06-12_MXN_126.00_Cafe.jpg",
                 ],
             )
             checked = load_workbook(root / CHECKED_WORKBOOK_NAME, data_only=True)
             try:
                 ws = checked[INVOICE_EXP_SHEET]
                 self.assertEqual(ws.max_row, 2)
-                self.assertEqual(ws.cell(2, 11).value, "final_crops/001a_2026-06-12_MXN_126.00_Cafe.jpg")
+                self.assertEqual(ws.cell(2, 11).value, "final_crops/food/001a_2026-06-12_MXN_126.00_Cafe.jpg")
             finally:
                 checked.close()
 
@@ -441,8 +446,11 @@ class ReimbursementExcelTests(unittest.TestCase):
             root = Path(temp)
             path = root / REIMBURSEMENT_WORKBOOK_NAME
             legacy_final = root / "final_crops" / "001_2026-06-12_MXN_100.00_Cafe.jpg"
+            legacy_nested = root / "final_crops" / "other" / "999_2026-06-12_MXN_25.00_Old.jpg"
             legacy_final.parent.mkdir()
+            legacy_nested.parent.mkdir()
             legacy_final.write_bytes(b"jpg")
+            legacy_nested.write_bytes(b"old")
             ReimbursementWorkbook(path).write_records(
                 [
                     InvoiceRecord(
@@ -460,7 +468,8 @@ class ReimbursementExcelTests(unittest.TestCase):
 
             self.assertEqual(result.records_written, 1)
             self.assertTrue((root / "review_crops" / legacy_final.name).exists())
-            self.assertTrue((root / "final_crops" / legacy_final.name).exists())
+            self.assertTrue((root / "review_crops" / legacy_nested.name).exists())
+            self.assertTrue((root / "final_crops" / "food" / legacy_final.name).exists())
             wb = load_workbook(path, data_only=True)
             try:
                 self.assertEqual(wb[INVOICE_EXP_SHEET].cell(2, 2).value, f"review_crops/{legacy_final.name}")
