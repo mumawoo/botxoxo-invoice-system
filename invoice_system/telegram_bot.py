@@ -374,6 +374,8 @@ def recent_message(settings: Settings, user_id: int, limit: int = 2, lang: str =
             no = _format_excel_no(row.get("No."))
             excel_row = row.get("_row")
             excel_sheet = row.get("_sheet") or "Excel"
+            if excel_sheet == INVOICE_EXP_SHEET:
+                excel_sheet = "Excel"
             category = str(row.get("Accounting Category") or row.get("Type") or "Other")
             currency = str(row.get("\u539f\u5e01\u79cd") or "MXN")
             amount = float(row.get("\u539f\u91d1\u989d") or row.get("MXN Amount") or 0)
@@ -1098,10 +1100,7 @@ def _excel_rows_by_crop_id(workbook: Path) -> dict[str, dict[str, object]]:
         return {}
     try:
         rows: dict[str, dict[str, object]] = {}
-        active_names = {"Food", "Other"}
-        worksheets = [ws for ws in wb.worksheets if ws.title in active_names]
-        if not worksheets:
-            worksheets = [ws for ws in wb.worksheets if ws.title == INVOICE_EXP_SHEET or ws.sheet_state == "visible"]
+        worksheets = [wb[INVOICE_EXP_SHEET]] if INVOICE_EXP_SHEET in wb.sheetnames else [ws for ws in wb.worksheets if ws.sheet_state == "visible"]
         for ws in worksheets:
             headers = {str(ws.cell(1, col).value or ""): col for col in range(1, ws.max_column + 1)}
             if "Invoice link" not in headers or "MXN Amount" not in headers:

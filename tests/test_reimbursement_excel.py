@@ -65,7 +65,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             finally:
                 wb.close()
 
-    def test_reimbursement_workbook_splits_food_and_other_sheets(self):
+    def test_reimbursement_workbook_keeps_manual_rows_in_one_sheet(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / REIMBURSEMENT_WORKBOOK_NAME
             store = ReimbursementWorkbook(path)
@@ -79,13 +79,10 @@ class ReimbursementExcelTests(unittest.TestCase):
 
             wb = load_workbook(path, data_only=True)
             try:
-                self.assertIn(FOOD_EXP_SHEET, wb.sheetnames)
-                self.assertIn(OTHER_EXP_SHEET, wb.sheetnames)
-                self.assertEqual(wb[FOOD_EXP_SHEET].cell(2, 9).value, "Cafe")
-                self.assertEqual(wb[OTHER_EXP_SHEET].cell(2, 9).value, "Pemex")
-                self.assertEqual(wb[INVOICE_EXP_SHEET].sheet_state, "hidden")
                 self.assertEqual(wb[INVOICE_EXP_SHEET].cell(2, 9).value, "Cafe")
                 self.assertEqual(wb[INVOICE_EXP_SHEET].cell(3, 9).value, "Pemex")
+                self.assertNotIn(FOOD_EXP_SHEET, wb.sheetnames)
+                self.assertNotIn(OTHER_EXP_SHEET, wb.sheetnames)
             finally:
                 wb.close()
 
@@ -283,6 +280,10 @@ class ReimbursementExcelTests(unittest.TestCase):
             self.assertEqual([path.name for path in final_crops], ["001_2026-06-12_MXN_100.00_Cafe.jpg", "002_2026-06-14_MXN_50.00_Store.jpg"])
             checked = load_workbook(root / CHECKED_WORKBOOK_NAME, data_only=True)
             try:
+                self.assertIn(FOOD_EXP_SHEET, checked.sheetnames)
+                self.assertIn(OTHER_EXP_SHEET, checked.sheetnames)
+                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, 8).value, "Cafe")
+                self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, 8).value, "Store")
                 ws = checked[INVOICE_EXP_SHEET]
                 self.assertEqual(ws.max_row, 3)
                 self.assertEqual(ws.cell(1, 2).value, "Date")
@@ -605,10 +606,10 @@ class ReimbursementExcelTests(unittest.TestCase):
 
             wb = load_workbook(path)
             try:
-                ws = wb[OTHER_EXP_SHEET]
-                self.assertEqual(row, 2)
-                self.assertEqual(wb.active.title, OTHER_EXP_SHEET)
-                self.assertEqual(ws.sheet_view.selection[0].activeCell, "A2")
+                ws = wb[INVOICE_EXP_SHEET]
+                self.assertEqual(row, 3)
+                self.assertEqual(wb.active.title, INVOICE_EXP_SHEET)
+                self.assertEqual(ws.sheet_view.selection[0].activeCell, "A3")
             finally:
                 wb.close()
 

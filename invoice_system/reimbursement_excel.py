@@ -23,7 +23,6 @@ CHECKED_WORKBOOK_NAME = "\u62a5\u9500_checked_2026.xlsx"
 INVOICE_EXP_SHEET = "Invoice exp"
 FOOD_EXP_SHEET = "Food"
 OTHER_EXP_SHEET = "Other"
-ACTIVE_REIMBURSEMENT_SHEETS = (FOOD_EXP_SHEET, OTHER_EXP_SHEET)
 EXCHANGE_RATE_SHEET = "exchange rate"
 CROP_LINKS_SHEET = "_crop_links"
 CORRECTED_MARKERS = {"corrected", "correct", "ok"}
@@ -138,36 +137,16 @@ def _sheet_name_for_values(values: list[object]) -> str:
     return FOOD_EXP_SHEET if _is_food_category(category) else OTHER_EXP_SHEET
 
 
-def _sheet_name_for_record(record: InvoiceRecord) -> str:
-    category = normalize_expense_category(record.expense_category, f"{record.seller} {record.contents}")
-    return FOOD_EXP_SHEET if category == "Food" else OTHER_EXP_SHEET
-
-
-def _active_reimbursement_sheets(wb):
-    return [wb[name] for name in ACTIVE_REIMBURSEMENT_SHEETS if name in wb.sheetnames]
-
-
-def _readable_reimbursement_sheets(wb):
-    sheets = _active_reimbursement_sheets(wb)
-    if sheets:
-        if INVOICE_EXP_SHEET in wb.sheetnames:
-            legacy = wb[INVOICE_EXP_SHEET]
-            legacy.sheet_state = "hidden"
-        return sheets
-    if INVOICE_EXP_SHEET in wb.sheetnames:
-        return [wb[INVOICE_EXP_SHEET]]
-    return []
-
-
-def _ensure_split_sheets(wb) -> None:
-    for name in ACTIVE_REIMBURSEMENT_SHEETS:
-        if name not in wb.sheetnames:
-            ws = wb.create_sheet(name, 0 if name == FOOD_EXP_SHEET else None)
-            ws.append(REIMBURSEMENT_HEADERS)
-        _ensure_headers(wb[name])
-        _format_invoice_exp(wb[name])
-    if INVOICE_EXP_SHEET in wb.sheetnames:
-        wb[INVOICE_EXP_SHEET].sheet_state = "hidden"
+def _ensure_manual_sheet(wb):
+    if INVOICE_EXP_SHEET not in wb.sheetnames:
+        ws = wb.create_sheet(INVOICE_EXP_SHEET, 0)
+        ws.append(REIMBURSEMENT_HEADERS)
+    ws = wb[INVOICE_EXP_SHEET]
+    ws.sheet_state = "visible"
+    _ensure_headers(ws)
+    _merge_old_split_sheets_to_manual(wb, ws)
+    _format_invoice_exp(ws)
+    return ws
 
 
 def load_reimbursement_records(path: Path) -> list[InvoiceRecord]:
@@ -175,15 +154,14 @@ def load_reimbursement_records(path: Path) -> list[InvoiceRecord]:
         return []
     wb = load_workbook(path, data_only=True)
     try:
-        _apply_legacy_edits_to_split_sheets(wb)
+        ws = _ensure_manual_sheet(wb)
         records: list[InvoiceRecord] = []
-        for ws in _readable_reimbursement_sheets(wb):
-            columns = _header_columns(ws)
-            for row_idx in range(2, ws.max_row + 1):
-                values = _row_values_by_header(ws, row_idx, columns)
-                if _row_is_deleted(ws, row_idx) or not _looks_like_reimbursement_row(values):
-                    continue
-                records.append(_record_from_reimbursement_row(values))
+        columns = _header_columns(ws)
+        for row_idx in range(2, ws.max_row + 1):
+            values = _row_values_by_header(ws, row_idx, columns)
+            if _row_is_deleted(ws, row_idx) or not _looks_like_reimbursement_row(values):
+                continue
+            records.append(_record_from_reimbursement_row(values))
         return records
     finally:
         wb.close()
@@ -205,35 +183,18 @@ def change_reimbursement_record(
     normalized_crop_id = _normalize_crop_id(crop_id)
     wb = load_workbook(workbook_path)
     try:
-        _ensure_split_sheets(wb)
-        _apply_legacy_edits_to_split_sheets(wb)
-        target_ws = None
-        target_columns = None
-        target_row_idx = None
-        for ws in _readable_reimbursement_sheets(wb):
-            _ensure_headers(ws)
-            columns = _header_columns(ws)
-            _rewrite_crop_links_to_review(ws, output_dir, columns)
-            _reconcile_manual_links_to_processing_state(output_dir, ws, columns)
-            columns = _header_columns(ws)
-            row_idx = _find_row_by_crop_id(ws, columns, normalized_crop_id)
-            if row_idx is not None:
-                target_ws = ws
-                target_columns = columns
-                target_row_idx = row_idx
-                break
-        if target_ws is None or target_columns is None or target_row_idx is None:
+        ws = _ensure_manual_sheet(wb)
+        columns = _header_columns(ws)
+        _rewrite_crop_links_to_review(ws, output_dir, columns)
+        _reconcile_manual_links_to_processing_state(output_dir, ws, columns)
+        columns = _header_columns(ws)
+        row_idx = _find_row_by_crop_id(ws, columns, normalized_crop_id)
+        if row_idx is None:
             raise LookupError(f"Cannot find crop {normalized_crop_id}")
-        ws = target_ws
-        columns = target_columns
-        row_idx = target_row_idx
         before = _row_snapshot(ws, row_idx, columns)
         rates = _rates_from_workbook(wb)
         _apply_manual_change(ws, row_idx, columns, rates, category=category, amount=amount, currency=currency, comment=comment, status=status)
         after = _row_snapshot(ws, row_idx, columns)
-        if category is not None:
-            _move_row_to_category_sheet(wb, ws, row_idx)
-        _sync_legacy_invoice_sheet(wb)
         wb.save(workbook_path)
         return ManualChangeResult(
             normalized_crop_id,
@@ -272,11 +233,8 @@ def build_checked_outputs(output_dir: Path) -> CheckedBuildResult:
     _migrate_final_crops_to_review(output_dir)
     wb = load_workbook(workbook_path, data_only=False)
     try:
-        _ensure_split_sheets(wb)
-        _migrate_legacy_invoice_rows_to_split_sheets(wb)
-        _apply_legacy_edits_to_split_sheets(wb)
-        readable_sheets = _readable_reimbursement_sheets(wb)
-        if not readable_sheets:
+        manual_ws = _ensure_manual_sheet(wb)
+        if manual_ws is None:
             return CheckedBuildResult(checked_path, final_dir, 0, 0, [])
         rates = _rates_from_workbook(wb)
         support_map = _crop_link_map(wb)
@@ -284,28 +242,25 @@ def build_checked_outputs(output_dir: Path) -> CheckedBuildResult:
         row_sheets: list[str] = []
         crop_sources: list[list[Path]] = []
         missing: list[str] = []
-        for manual_ws in readable_sheets:
-            _ensure_headers(manual_ws)
-            columns = _header_columns(manual_ws)
-            _rewrite_crop_links_to_review(manual_ws, workbook_path.parent, columns)
-            _reconcile_manual_links_to_processing_state(workbook_path.parent, manual_ws, columns)
-            columns = _header_columns(manual_ws)
-            for row_idx in range(2, manual_ws.max_row + 1):
-                values = _row_values_by_header(manual_ws, row_idx, columns)
-                if _row_is_deleted(manual_ws, row_idx) or not _looks_like_reimbursement_row(values):
-                    continue
-                rows.append(values)
-                row_sheets.append(_sheet_name_for_values(values))
-                source = _resolve_crop_source(workbook_path.parent, values[1])
-                sources = [source] if source is not None else []
-                for support in support_map.get(Path(str(values[1] or "")).name, []):
-                    support_source = _resolve_crop_source(workbook_path.parent, support)
-                    if support_source is not None and support_source not in sources:
-                        sources.append(support_source)
-                crop_sources.append(sources)
-                if source is None:
-                    missing.append(str(values[1] or f"{manual_ws.title} row {row_idx}"))
-        _sync_legacy_invoice_sheet(wb)
+        columns = _header_columns(manual_ws)
+        _rewrite_crop_links_to_review(manual_ws, workbook_path.parent, columns)
+        _reconcile_manual_links_to_processing_state(workbook_path.parent, manual_ws, columns)
+        columns = _header_columns(manual_ws)
+        for row_idx in range(2, manual_ws.max_row + 1):
+            values = _row_values_by_header(manual_ws, row_idx, columns)
+            if _row_is_deleted(manual_ws, row_idx) or not _looks_like_reimbursement_row(values):
+                continue
+            rows.append(values)
+            row_sheets.append(_sheet_name_for_values(values))
+            source = _resolve_crop_source(workbook_path.parent, values[1])
+            sources = [source] if source is not None else []
+            for support in support_map.get(Path(str(values[1] or "")).name, []):
+                support_source = _resolve_crop_source(workbook_path.parent, support)
+                if support_source is not None and support_source not in sources:
+                    sources.append(support_source)
+            crop_sources.append(sources)
+            if source is None:
+                missing.append(str(values[1] or f"{manual_ws.title} row {row_idx}"))
         try:
             wb.save(workbook_path)
         except OSError:
@@ -375,19 +330,9 @@ def focus_reimbursement_workbook(path: Path, target_day: date | None = None) -> 
         return 0
     wb = load_workbook(path)
     try:
-        _apply_legacy_edits_to_split_sheets(wb)
-        sheets = _readable_reimbursement_sheets(wb)
-        if not sheets:
-            return 0
         target = target_day or date.today()
-        ws = sheets[0]
+        ws = _ensure_manual_sheet(wb)
         row_idx = _focus_row(ws, target)
-        for candidate in sheets:
-            candidate_row = _focus_row(candidate, target)
-            if _parse_date(candidate.cell(candidate_row, _header_columns(candidate).get("Date", 3)).value) == target:
-                ws = candidate
-                row_idx = candidate_row
-                break
         wb.active = wb.sheetnames.index(ws.title)
         cell_ref = f"A{row_idx}"
         if ws.sheet_view.selection:
@@ -407,18 +352,17 @@ def corrected_crop_names(workbook_path: Path) -> set[str]:
         return set()
     wb = load_workbook(workbook_path, data_only=False)
     try:
-        _apply_legacy_edits_to_split_sheets(wb)
         names: set[str] = set()
-        for ws in _readable_reimbursement_sheets(wb):
-            columns = _header_columns(ws)
-            link_col = columns.get("Invoice link", 2)
-            for row_idx in range(2, ws.max_row + 1):
-                if not _row_is_protected(ws, row_idx):
-                    continue
-                cell = ws.cell(row_idx, link_col)
-                link = cell.hyperlink.target if cell.hyperlink else cell.value
-                if link:
-                    names.add(Path(str(link)).name)
+        ws = _ensure_manual_sheet(wb)
+        columns = _header_columns(ws)
+        link_col = columns.get("Invoice link", 2)
+        for row_idx in range(2, ws.max_row + 1):
+            if not _row_is_protected(ws, row_idx):
+                continue
+            cell = ws.cell(row_idx, link_col)
+            link = cell.hyperlink.target if cell.hyperlink else cell.value
+            if link:
+                names.add(Path(str(link)).name)
         return names
     finally:
         wb.close()
@@ -459,14 +403,13 @@ class ReimbursementWorkbook:
             return set()
         wb = load_workbook(self.workbook_path, data_only=False)
         try:
-            _apply_legacy_edits_to_split_sheets(wb)
+            ws = _ensure_manual_sheet(wb)
             numbers: set[int] = set()
-            for ws in _readable_reimbursement_sheets(wb):
-                for row_idx in range(2, ws.max_row + 1):
-                    if _row_is_protected(ws, row_idx):
-                        number = _to_int(ws.cell(row_idx, 1).value)
-                        if number:
-                            numbers.add(number)
+            for row_idx in range(2, ws.max_row + 1):
+                if _row_is_protected(ws, row_idx):
+                    number = _to_int(ws.cell(row_idx, 1).value)
+                    if number:
+                        numbers.add(number)
             return numbers
         finally:
             wb.close()
@@ -476,53 +419,38 @@ class ReimbursementWorkbook:
             return list(records)
         wb = load_workbook(self.workbook_path, data_only=False)
         try:
-            _apply_legacy_edits_to_split_sheets(wb)
+            ws = _ensure_manual_sheet(wb)
             rates = _rates_from_workbook(wb)
-            locked_keys: set[tuple[str, str, str, float]] = set()
-            deleted_crops: set[str] = set()
-            for ws in _readable_reimbursement_sheets(wb):
-                locked_keys.update(_protected_record_keys(ws, rates))
-                deleted_crops.update(_deleted_crop_names(ws))
+            locked_keys = _protected_record_keys(ws, rates)
+            deleted_crops = _deleted_crop_names(ws)
             return [record for record in records if _record_match_key(record, rates) not in locked_keys and not _record_has_crop_name(record, deleted_crops)]
         finally:
             wb.close()
 
     def write_records(self, records: list[InvoiceRecord]) -> ReimbursementWriteResult:
         wb = _load_or_create_workbook(self.workbook_path)
-        _ensure_split_sheets(wb)
-        _apply_legacy_edits_to_split_sheets(wb)
-        sheets = {name: wb[name] for name in ACTIVE_REIMBURSEMENT_SHEETS}
+        ws = _ensure_manual_sheet(wb)
         rates, rates_updated, fx_error = self._ensure_exchange_rates(wb, records)
         crop_links = _crop_link_map(wb)
-        locked_rows_by_sheet = {name: _protected_rows(ws) for name, ws in sheets.items()}
-        locked_keys: set[tuple[str, str, str, float]] = set()
-        deleted_crops: set[str] = set()
-        for ws in sheets.values():
-            locked_keys.update(_protected_record_keys(ws, rates))
-            deleted_crops.update(_deleted_crop_names(ws))
+        locked_rows = _protected_rows(ws)
+        locked_keys = _protected_record_keys(ws, rates)
+        deleted_crops = _deleted_crop_names(ws)
         output_records = [record for record in records if _record_match_key(record, rates) not in locked_keys and not _record_has_crop_name(record, deleted_crops)]
-        for name, ws in sheets.items():
-            _clear_unlocked_invoice_rows(ws, locked_rows_by_sheet[name])
+        _clear_unlocked_invoice_rows(ws, locked_rows)
 
-        write_rows = {name: 2 for name in ACTIVE_REIMBURSEMENT_SHEETS}
+        write_row = 2
         rows_written = 0
         for record in output_records:
-            sheet_name = _sheet_name_for_record(record)
-            ws = sheets[sheet_name]
-            write_row = write_rows[sheet_name]
-            while write_row in locked_rows_by_sheet[sheet_name]:
+            while write_row in locked_rows:
                 write_row += 1
             _write_reimbursement_row(ws, write_row, record, rates)
             _set_crop_link_mapping(crop_links, record)
             write_row += 1
-            write_rows[sheet_name] = write_row
             rows_written += 1
 
         _write_crop_links_sheet(wb, crop_links)
-        for ws in sheets.values():
-            _format_invoice_exp(ws)
-            _autosize(ws, max_col=len(REIMBURSEMENT_HEADERS))
-        _sync_legacy_invoice_sheet(wb)
+        _format_invoice_exp(ws)
+        _autosize(ws, max_col=len(REIMBURSEMENT_HEADERS))
         wb.save(self.workbook_path)
         wb.close()
         return ReimbursementWriteResult(rows_written, self.workbook_path, rates_updated, fx_error)
@@ -903,128 +831,56 @@ def _safe_filename_part(value: str) -> str:
 def _load_or_create_workbook(path: Path):
     if path.exists():
         wb = load_workbook(path)
-        _ensure_split_sheets(wb)
-        _migrate_legacy_invoice_rows_to_split_sheets(wb)
-        _apply_legacy_edits_to_split_sheets(wb)
+        _ensure_manual_sheet(wb)
         if EXCHANGE_RATE_SHEET not in wb.sheetnames:
             ws = wb.create_sheet(EXCHANGE_RATE_SHEET)
             ws.append(EXCHANGE_RATE_HEADERS)
-        _sync_legacy_invoice_sheet(wb)
         return wb
     wb = Workbook()
     ws = wb.active
-    ws.title = FOOD_EXP_SHEET
+    ws.title = INVOICE_EXP_SHEET
     ws.append(REIMBURSEMENT_HEADERS)
-    other_ws = wb.create_sheet(OTHER_EXP_SHEET)
-    other_ws.append(REIMBURSEMENT_HEADERS)
-    legacy_ws = wb.create_sheet(INVOICE_EXP_SHEET)
-    legacy_ws.append(REIMBURSEMENT_HEADERS)
-    legacy_ws.sheet_state = "hidden"
     rates_ws = wb.create_sheet(EXCHANGE_RATE_SHEET)
     rates_ws.append(EXCHANGE_RATE_HEADERS)
     _format_invoice_exp(ws)
-    _format_invoice_exp(other_ws)
     return wb
 
 
-def _migrate_legacy_invoice_rows_to_split_sheets(wb) -> None:
-    if INVOICE_EXP_SHEET not in wb.sheetnames:
+def _merge_old_split_sheets_to_manual(wb, manual_ws) -> None:
+    split_sheets = [wb[name] for name in (FOOD_EXP_SHEET, OTHER_EXP_SHEET) if name in wb.sheetnames and name != INVOICE_EXP_SHEET]
+    if not split_sheets:
         return
-    legacy = wb[INVOICE_EXP_SHEET]
-    if any(_looks_like_reimbursement_row(_row_values_by_header(ws, row_idx, _header_columns(ws))) for ws in _active_reimbursement_sheets(wb) for row_idx in range(2, ws.max_row + 1)):
-        legacy.sheet_state = "hidden"
-        return
-    columns = _header_columns(legacy)
-    for row_idx in range(2, legacy.max_row + 1):
-        values = _row_values_by_header(legacy, row_idx, columns)
-        if not _looks_like_reimbursement_row(values):
-            continue
-        target = wb[_sheet_name_for_values(values)]
-        _append_values_with_link(target, values)
-        if _row_is_deleted(legacy, row_idx):
-            target.cell(target.max_row, _header_columns(target).get(MANUAL_STATUS_HEADER, len(REIMBURSEMENT_HEADERS))).value = "delete"
-        elif _row_is_corrected(legacy, row_idx):
-            target.cell(target.max_row, _header_columns(target).get(MANUAL_STATUS_HEADER, len(REIMBURSEMENT_HEADERS))).value = "ok"
-    legacy.sheet_state = "hidden"
-
-
-def _apply_legacy_edits_to_split_sheets(wb) -> None:
-    if INVOICE_EXP_SHEET not in wb.sheetnames or not _active_reimbursement_sheets(wb):
-        return
-    legacy = wb[INVOICE_EXP_SHEET]
-    legacy_columns = _header_columns(legacy)
-    for row_idx in range(2, legacy.max_row + 1):
-        if not _row_is_protected(legacy, row_idx):
-            continue
-        values = _row_values_by_header(legacy, row_idx, legacy_columns)
-        if not _looks_like_reimbursement_row(values):
-            continue
-        match = _find_matching_split_row(wb, values)
-        target_name = _sheet_name_for_values(values)
-        if match is None:
-            target = wb[target_name]
-            _append_values_with_link(target, values)
-            continue
-        source_ws, source_row = match
-        target = wb[target_name]
-        if source_ws.title != target_name:
-            _append_values_with_link(target, values)
-            source_ws.delete_rows(source_row, 1)
-        else:
-            _replace_row_values(source_ws, source_row, values)
-    legacy.sheet_state = "hidden"
-
-
-def _find_matching_split_row(wb, values: list[object]):
-    crop_name = Path(str(values[1] or "")).name
-    number = _to_int(values[0])
-    for ws in _active_reimbursement_sheets(wb):
-        columns = _header_columns(ws)
-        link_col = columns.get("Invoice link", 2)
-        no_col = columns.get("No.", 1)
-        for row_idx in range(2, ws.max_row + 1):
-            link_cell = ws.cell(row_idx, link_col)
-            link = str(link_cell.hyperlink.target if link_cell.hyperlink else link_cell.value or "")
-            if crop_name and Path(link).name == crop_name:
-                return ws, row_idx
-            if number and _to_int(ws.cell(row_idx, no_col).value) == number:
-                return ws, row_idx
-    return None
-
-
-def _replace_row_values(ws, row_idx: int, values: list[object]) -> None:
-    values = list(values[: len(REIMBURSEMENT_HEADERS)])
-    values += [None] * (len(REIMBURSEMENT_HEADERS) - len(values))
-    columns = _header_columns(ws)
-    for index, header in enumerate(REIMBURSEMENT_HEADERS):
-        col = columns.get(header, index + 1)
-        cell = ws.cell(row_idx, col)
-        cell.value = values[index]
-        cell.hyperlink = None
-    _format_row(ws, row_idx, columns)
-    link = str(values[1] or "").strip()
-    if link:
-        link_cell = ws.cell(row_idx, columns.get("Invoice link", 2))
-        link_cell.hyperlink = link
-        link_cell.style = "Hyperlink"
-
-
-def _sync_legacy_invoice_sheet(wb) -> None:
-    if INVOICE_EXP_SHEET in wb.sheetnames:
-        ws = wb[INVOICE_EXP_SHEET]
-        ws.delete_rows(1, ws.max_row)
-    else:
-        ws = wb.create_sheet(INVOICE_EXP_SHEET)
-    ws.append(REIMBURSEMENT_HEADERS)
-    ws.sheet_state = "hidden"
-    for source in _active_reimbursement_sheets(wb):
+    manual_columns = _header_columns(manual_ws)
+    existing = {
+        _row_identity(_row_values_by_header(manual_ws, row_idx, manual_columns))
+        for row_idx in range(2, manual_ws.max_row + 1)
+        if _looks_like_reimbursement_row(_row_values_by_header(manual_ws, row_idx, manual_columns))
+    }
+    for source in split_sheets:
         columns = _header_columns(source)
         for row_idx in range(2, source.max_row + 1):
             values = _row_values_by_header(source, row_idx, columns)
-            if _looks_like_reimbursement_row(values):
-                _append_values_with_link(ws, values)
-    _format_invoice_exp(ws)
-    _autosize(ws, max_col=len(REIMBURSEMENT_HEADERS))
+            if not _looks_like_reimbursement_row(values):
+                continue
+            identity = _row_identity(values)
+            if identity in existing:
+                continue
+            _append_values_with_link(manual_ws, values)
+            existing.add(identity)
+    for source in split_sheets:
+        if len(wb.sheetnames) > 1:
+            del wb[source.title]
+
+
+def _row_identity(values: list[object]) -> tuple[str, str, str, float, str]:
+    crop_name = Path(str(values[1] or "")).name
+    date_text = _date_to_text(values[2])
+    merchant = re.sub(r"\s+", " ", str(values[8] or "Unknown")).strip().casefold()
+    original_currency = _normalize_currency(str(values[5] or "MXN"))
+    original_amount = _to_float(values[6])
+    mxn_amount = _to_float(values[3])
+    amount = original_amount if original_currency != "MXN" and original_amount > 0 else mxn_amount
+    return (crop_name, date_text, merchant, round(amount, 2), original_currency)
 
 
 def _append_values_with_link(ws, values: list[object]) -> None:
@@ -1038,17 +894,6 @@ def _append_values_with_link(ws, values: list[object]) -> None:
         cell = ws.cell(ws.max_row, link_col)
         cell.hyperlink = link
         cell.style = "Hyperlink"
-
-
-def _move_row_to_category_sheet(wb, ws, row_idx: int) -> None:
-    columns = _header_columns(ws)
-    values = _row_values_by_header(ws, row_idx, columns)
-    target_name = _sheet_name_for_values(values)
-    if ws.title == target_name or target_name not in wb.sheetnames:
-        return
-    target = wb[target_name]
-    _append_values_with_link(target, values)
-    ws.delete_rows(row_idx, 1)
 
 
 def _ensure_headers(ws, headers: list[str] | None = None) -> None:
