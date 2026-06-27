@@ -352,17 +352,14 @@ def recent_message(settings: Settings, user_id: int, limit: int = 2, lang: str =
     excel_rows = _excel_rows_by_crop_id(telegram_user_workbook(settings, user_id))
     lines = [f"最近上传 {min(limit, len(done_items))} 次" if is_zh(lang) else f"Recent uploads / 最近 {min(limit, len(done_items))} 次"]
     for input_index, item in enumerate(done_items[:limit], start=1):
-        source_name = Path(item.path).name
         crop_groups = _crop_groups_for_source(output_dir, item.path)
         excel_matches = sum(1 for crop_ids in crop_groups if crop_ids and excel_rows.get(crop_ids[0]) is not None)
         crop_total = len([crop for group in crop_groups for crop in group])
         lines.append("")
         if is_zh(lang):
             lines.append(f"输入 {input_index}: {item.status} | Excel 行 {excel_matches} | crops {crop_total}")
-            lines.append(f"照片: {source_name[:42]}{'...' if len(source_name) > 42 else ''}")
         else:
             lines.append(f"Input {input_index}: {item.status} | Excel rows {excel_matches} | crops {crop_total}")
-            lines.append(f"Photo: {source_name[:42]}{'...' if len(source_name) > 42 else ''}")
         if not crop_groups:
             lines.append("- 没找到 crop 记录" if is_zh(lang) else "- no crop records found")
             continue

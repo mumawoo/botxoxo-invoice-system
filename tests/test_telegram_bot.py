@@ -431,7 +431,7 @@ class TelegramBotTests(unittest.TestCase):
             old_crop.write_bytes(b"old")
             new_crop.write_bytes(b"new")
             old_photo = root / "old.jpg"
-            new_photo = root / "new.jpg"
+            new_photo = root / "171139_AgACAgEAAxkBAAIBLWpAWKnEY0vG5Y5o1q32EVFoD6YmAAJTDGsbNc0AAUZLghjrS_Ao9AEAAwIAA3kAAzwE.jpg"
             old_photo.write_bytes(b"old")
             new_photo.write_bytes(b"new")
             save_queue_state(
@@ -605,6 +605,8 @@ class TelegramBotTests(unittest.TestCase):
 
             self.assertIn("Recent uploads", text)
             self.assertIn("Input 1: done | Excel rows 2 | crops 2", text)
+            self.assertNotIn("Photo:", text)
+            self.assertNotIn("171139_AgACAgEAAxkBAAIB", text)
             self.assertIn("040 -> Excel row 3, No. 040", text)
             self.assertIn("041 -> Excel row 4, No. 041", text)
             self.assertIn("| delete", text)
