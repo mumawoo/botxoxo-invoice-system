@@ -1,23 +1,30 @@
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 from invoice_system.config import Settings
-from invoice_system.models import PipelineSummary
+from invoice_system.models import InvoiceRecord, PipelineSummary
 from invoice_system.queue_worker import (
     DONE,
     FAILED_RETRYABLE,
     PENDING,
+    QueueItem,
+    QueueState,
     discover_and_enqueue,
     enqueue_photo,
     load_queue_state,
     process_user_queue_once,
+    queue_totals_for_day,
     reset_active_user_workspace,
     retry_failed,
+    save_queue_state,
     telegram_user_day_dir,
     telegram_user_output_dir,
     telegram_user_queue_path,
+    telegram_user_workbook,
 )
+from invoice_system.reimbursement_excel import ReimbursementWorkbook
 
 
 class QueueWorkerTests(unittest.TestCase):
@@ -127,6 +134,56 @@ class QueueWorkerTests(unittest.TestCase):
             archived_files = list(summary.archive_dir.rglob("*"))
             self.assertTrue(any(path.name == "photo.jpg" for path in archived_files))
             self.assertTrue(any(path.name == "001.jpg" for path in archived_files))
+
+    def test_queue_totals_for_day_filters_checked_records_to_today_sources(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = _settings(Path(temp))
+            output_dir = telegram_user_output_dir(settings, 123)
+            review = output_dir / "review_crops"
+            review.mkdir(parents=True)
+            old_crop = review / "001_2026-06-10_MXN_100.00_Old.jpg"
+            today_crop = review / "082_2026-06-27_MXN_215.00_Restaurante.jpg"
+            old_crop.write_bytes(b"old")
+            today_crop.write_bytes(b"today")
+            old_photo = telegram_user_day_dir(settings, 123, datetime(2026, 6, 26, 10, 0)) / "old.jpg"
+            today_photo = telegram_user_day_dir(settings, 123, datetime(2026, 6, 27, 10, 0)) / "today.jpg"
+            old_photo.parent.mkdir(parents=True)
+            today_photo.parent.mkdir(parents=True)
+            old_photo.write_bytes(b"old")
+            today_photo.write_bytes(b"today")
+            ReimbursementWorkbook(telegram_user_workbook(settings, 123)).write_records(
+                [
+                    InvoiceRecord(line_no=1, invoice_date="2026-06-10", expense_category="Food", seller="Old", total_amount=100, crop_image=str(old_crop)),
+                    InvoiceRecord(line_no=82, invoice_date="2026-06-27", expense_category="Food", seller="Restaurante", total_amount=215, crop_image=str(today_crop)),
+                ]
+            )
+            save_queue_state(
+                telegram_user_queue_path(settings, 123),
+                QueueState(
+                    [
+                        QueueItem(path=str(old_photo), status=DONE, updated_at="2026-06-26T11:00:00", row_count=1, total_amount=100, category_totals={"Food": 100}),
+                        QueueItem(path=str(today_photo), status=DONE, updated_at="2026-06-27T11:00:00", row_count=1, total_amount=215, category_totals={"Food": 215}),
+                    ]
+                ),
+            )
+            (output_dir / "processing_state.json").write_text(
+                '{"records":[{"source_image":"'
+                + str(old_photo).replace("\\", "\\\\")
+                + '","crop_image":"'
+                + str(old_crop).replace("\\", "\\\\")
+                + '"},{"source_image":"'
+                + str(today_photo).replace("\\", "\\\\")
+                + '","crop_image":"'
+                + str(today_crop).replace("\\", "\\\\")
+                + '"}]}',
+                encoding="utf-8",
+            )
+
+            totals = queue_totals_for_day(settings, 123, "2026-06-27")
+
+            self.assertEqual(totals.record_count, 1)
+            self.assertEqual(totals.total_amount, 215)
+            self.assertEqual(totals.category_totals, {"Food": 215})
 
 
 class FakeQueuePipeline:

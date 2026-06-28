@@ -232,13 +232,21 @@ class TelegramBotTests(unittest.TestCase):
                 )
             ]
             ReimbursementWorkbook(telegram_user_workbook(settings, 123)).write_records(records)
+            photo = root / "photo.jpg"
+            photo.write_bytes(b"jpg")
             item = QueueItem(
-                path=str(root / "photo.jpg"),
+                path=str(photo),
                 status=DONE,
                 row_count=1,
                 total_amount=150,
                 category_totals={"Food": 150},
                 updated_at=datetime.now().isoformat(timespec="seconds"),
+            )
+            save_queue_state(telegram_user_queue_path(settings, 123), QueueState([item]))
+            output = settings.output_dir / "telegram" / "123"
+            (output / "processing_state.json").write_text(
+                json.dumps({"records": [{"source_image": str(photo), "crop_image": records[0].crop_image}]}),
+                encoding="utf-8",
             )
 
             text = scan_completion_message(settings, 123, item, records)
@@ -247,7 +255,7 @@ class TelegramBotTests(unittest.TestCase):
             self.assertNotIn("Photo:", text)
             self.assertNotIn("photo.jpg", text)
             self.assertIn("This scan", text)
-            self.assertIn("Crops:\n- 021 Food: MXN 150.00 | Cafe", text)
+            self.assertIn("Crops:\n- 021 2026-06-20 Food: MXN 150.00 | Cafe", text)
             self.assertIn("Original totals:\n- MXN: 150.00", text)
             self.assertIn("Today\nRows: 1\nMXN total: 150.00", text)
             self.assertNotIn("Since last submit", text)

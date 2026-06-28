@@ -14,7 +14,7 @@ from .excel_store import load_invoice_records
 from .image_splitter import iter_images
 from .models import InvoiceRecord
 from .pipeline import InvoicePipeline
-from .reimbursement_excel import build_checked_outputs, checked_workbook_path, reimbursement_workbook_path
+from .reimbursement_excel import reimbursement_workbook_path
 
 PENDING = "pending"
 PROCESSING = "processing"
@@ -309,27 +309,68 @@ def format_reset_summary(summary: ResetSummary) -> str:
 
 
 def queue_totals_for_day(settings: Settings, user_id: int, day: str | None = None) -> QueueTotals:
-    # The active reimbursement workbook is the source of truth after manual
-    # review. Queue item totals can be stale when a user marks rows deleted.
     output_dir = telegram_user_output_dir(settings, user_id)
-    build_checked_outputs(output_dir)
-    records_from_excel = _safe_load_invoice_records(checked_workbook_path(output_dir))
-    if records_from_excel:
-        return QueueTotals(len(records_from_excel), *_record_totals(records_from_excel))
     target_day = day or datetime.now().date().isoformat()
     state = load_queue_state(telegram_user_queue_path(settings, user_id))
+    today_items = [item for item in state.items if item.status == DONE and str(item.updated_at or "").startswith(target_day)]
+    if not today_items:
+        return QueueTotals(0, 0.0, {})
+
+    crop_ids = _crop_ids_for_sources(output_dir, [item.path for item in today_items])
+    if crop_ids:
+        records_from_excel = _safe_load_invoice_records(reimbursement_workbook_path(output_dir))
+        records_from_excel = [record for record in records_from_excel if _record_has_crop_id(record, crop_ids)]
+        if records_from_excel:
+            return QueueTotals(len(records_from_excel), *_record_totals(records_from_excel))
+
     total = 0.0
     records = 0
     category_totals: dict[str, float] = {}
-    for item in state.items:
-        if item.status != DONE or not str(item.updated_at or "").startswith(target_day):
-            continue
+    for item in today_items:
         records += int(item.row_count or 0)
         total = round(total + float(item.total_amount or 0), 2)
         for category, amount in (item.category_totals or {}).items():
             normalized = normalize_expense_category(category)
             category_totals[normalized] = round(category_totals.get(normalized, 0.0) + float(amount or 0), 2)
     return QueueTotals(records, total, category_totals)
+
+
+def _crop_ids_for_sources(output_dir: Path, source_images: list[str]) -> set[str]:
+    state_path = output_dir / "processing_state.json"
+    if not state_path.exists():
+        return set()
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    source_keys = {_path_key(Path(source)) for source in source_images}
+    crop_ids: set[str] = set()
+    for record in data.get("records", []):
+        if not isinstance(record, dict):
+            continue
+        if _path_key(Path(str(record.get("source_image") or ""))) not in source_keys:
+            continue
+        for crop_text in [str(record.get("crop_image") or ""), *[str(item or "") for item in record.get("supporting_crop_images", []) or []]]:
+            crop_id = _crop_id_from_path_text(crop_text)
+            if crop_id:
+                crop_ids.add(crop_id)
+    return crop_ids
+
+
+def _record_has_crop_id(record: InvoiceRecord, crop_ids: set[str]) -> bool:
+    for crop_text in [record.crop_image, *list(getattr(record, "supporting_crop_images", []) or [])]:
+        crop_id = _crop_id_from_path_text(str(crop_text or ""))
+        if crop_id and crop_id in crop_ids:
+            return True
+    return False
+
+
+def _crop_id_from_path_text(value: str) -> str:
+    import re
+
+    name = Path(str(value or "")).name
+    match = re.match(r"(\d{3,})_", name)
+    return match.group(1) if match else ""
 
 
 def load_queue_state(path: Path) -> QueueState:

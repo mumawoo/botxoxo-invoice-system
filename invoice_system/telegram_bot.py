@@ -1092,7 +1092,8 @@ def _format_scan_record_lines(records: list[InvoiceRecord]) -> list[str]:
         currency = str(getattr(record, "original_currency", record.currency) or "MXN").upper()
         amount = float(getattr(record, "original_amount", record.total_amount) or 0)
         seller = str(record.seller or "Unknown").strip() or "Unknown"
-        lines.append(f"- {index} {category}: {currency} {amount:.2f} | {seller}")
+        invoice_date = str(record.invoice_date or "unknown-date").strip() or "unknown-date"
+        lines.append(f"- {index} {invoice_date} {category}: {currency} {amount:.2f} | {seller}")
         if len(crop_ids) > 1:
             lines.append(f"  Combined: {' + '.join(crop_ids)} -> one Excel row; crops kept as a/b")
     return lines
