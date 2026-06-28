@@ -39,7 +39,7 @@ from .reimbursement import (
     submitted_batches_text,
     unsubmitted_summary,
 )
-from .reimbursement_excel import INVOICE_EXP_SHEET, REVIEW_CROPS_DIR, focus_reimbursement_workbook
+from .reimbursement_excel import INVOICE_EXP_SHEET, REVIEW_CROPS_DIR, checked_workbook_path, focus_reimbursement_workbook
 from .reimbursement_excel import available_crop_ids, change_reimbursement_record
 
 SUBMIT_CONFIRM_WORDS = {"confirm", "yes", "ok", "\u786e\u8ba4", "\u63d0\u4ea4"}
@@ -212,6 +212,7 @@ def telegram_command_menu(lang: str = LANG_EN) -> list[tuple[str, str]]:
             ("change", "修改 crop：/change 021 type Other + 备注"),
             ("del", "删除 crop：/del 021"),
             ("excel", "下载当前人工复核 Excel"),
+            ("checked", "下载财务版 Food/Other Excel"),
             ("crops", "发送最近 review crop 图片"),
             ("recent", "最近 2 次上传和 Excel 行"),
             ("rerun", "从修改后的财务 Excel 重建"),
@@ -227,6 +228,7 @@ def telegram_command_menu(lang: str = LANG_EN) -> list[tuple[str, str]]:
         ("change", "edit crop: /change 021 type Other + note"),
         ("del", "delete crop: /del 021"),
         ("excel", "download current reimbursement Excel"),
+        ("checked", "download finance Food/Other Excel"),
         ("crops", "send latest review crop images"),
         ("recent", "last 2 uploads and Excel rows"),
         ("rerun", "rebuild from edited finance Excel"),
@@ -860,6 +862,28 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
         with workbook.open("rb") as handle:
             await message.reply_document(document=handle, filename=workbook.name)
 
+    async def checked_excel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await reply_not_allowed(update):
+            return
+        message = update.effective_message
+        user = update.effective_user
+        if message is None or user is None:
+            return
+        output_dir = telegram_user_output_dir(settings, user.id)
+        workbook = checked_workbook_path(output_dir)
+        try:
+            refresh_checked_outputs(settings, user.id)
+        except OSError:
+            lang = user_language(settings, user.id)
+            await message.reply_text("Excel 已打开/锁定。请关闭后重新发送 /checked。" if is_zh(lang) else "Excel is open/locked. Close it and resend /checked.")
+            return
+        if not workbook.exists():
+            lang = user_language(settings, user.id)
+            await message.reply_text("还没有财务版 checked Excel。请先发送照片或使用 /report 生成。" if is_zh(lang) else "No checked finance Excel yet. Send photos first or use /report.")
+            return
+        with workbook.open("rb") as handle:
+            await message.reply_document(document=handle, filename=workbook.name)
+
     async def crops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await reply_not_allowed(update):
             return
@@ -961,6 +985,7 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("restart", restart))
     app.add_handler(CommandHandler("excel", excel))
+    app.add_handler(CommandHandler("checked", checked_excel))
     app.add_handler(CommandHandler("crops", crops))
     app.add_handler(CommandHandler("change", change))
     app.add_handler(CommandHandler("del", delete_crop))

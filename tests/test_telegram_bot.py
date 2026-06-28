@@ -141,6 +141,7 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn("/status", text)
         self.assertIn("/restart", text)
         self.assertIn("/excel", text)
+        self.assertIn("/checked", text)
         self.assertIn("/crops", text)
         self.assertIn("/change", text)
         self.assertIn("/del", text)
@@ -165,6 +166,7 @@ class TelegramBotTests(unittest.TestCase):
 
         self.assertIn("change", commands)
         self.assertIn("del", commands)
+        self.assertIn("checked", commands)
         self.assertIn("rerun", commands)
         self.assertIn("submit", commands)
         self.assertIn("edit crop", commands["change"])
