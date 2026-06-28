@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import errno
 from datetime import datetime
 from pathlib import Path
 
@@ -719,10 +720,12 @@ def format_telegram_config(settings: Settings, auto_process: bool | None = None)
 def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> None:
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    lock_path = _acquire_telegram_instance_lock(settings)
     try:
         from telegram import BotCommand, MenuButtonCommands, Update
         from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
     except ImportError as exc:
+        _release_telegram_instance_lock(lock_path)
         raise RuntimeError("Install python-telegram-bot to use Telegram ingestion") from exc
 
     pending_submit_users: set[int] = set()
@@ -998,7 +1001,69 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
     app.add_handler(CommandHandler("submit", submit))
     app.add_handler(MessageHandler(filters.PHOTO, photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
-    app.run_polling()
+    try:
+        app.run_polling()
+    finally:
+        _release_telegram_instance_lock(lock_path)
+
+
+def _acquire_telegram_instance_lock(settings: Settings) -> Path:
+    lock_path = settings.output_dir / "telegram_bot.pid"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        except FileExistsError:
+            existing_pid = _read_pid_file(lock_path)
+            if existing_pid and _pid_is_running(existing_pid):
+                raise RuntimeError(f"Telegram bot already running with PID {existing_pid}. Stop that process before starting another one.")
+            try:
+                lock_path.unlink()
+            except OSError as exc:
+                if exc.errno not in {errno.ENOENT, errno.EACCES, errno.EPERM}:
+                    raise
+                raise RuntimeError(f"Telegram bot lock exists but cannot be removed: {lock_path}") from exc
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+        return lock_path
+
+
+def _release_telegram_instance_lock(lock_path: Path) -> None:
+    try:
+        if _read_pid_file(lock_path) == os.getpid():
+            lock_path.unlink()
+    except OSError:
+        pass
+
+
+def _read_pid_file(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            process_query_limited_information = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, int(pid))
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _telegram_item_notifier(settings: Settings, bot, loop: asyncio.AbstractEventLoop):

@@ -38,6 +38,8 @@ from invoice_system.telegram_bot import (
     telegram_start_message,
     user_language,
     whoami_message,
+    _acquire_telegram_instance_lock,
+    _release_telegram_instance_lock,
 )
 
 
@@ -170,6 +172,24 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn("rerun", commands)
         self.assertIn("submit", commands)
         self.assertIn("edit crop", commands["change"])
+
+    def test_telegram_instance_lock_blocks_second_start_and_cleans_stale_pid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = Settings(root=Path(temp), output_dir=Path(temp) / "out")
+
+            lock = _acquire_telegram_instance_lock(settings)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "already running"):
+                    _acquire_telegram_instance_lock(settings)
+            finally:
+                _release_telegram_instance_lock(lock)
+
+            lock.write_text("99999999", encoding="utf-8")
+            lock = _acquire_telegram_instance_lock(settings)
+            try:
+                self.assertTrue(lock.exists())
+            finally:
+                _release_telegram_instance_lock(lock)
 
     def test_empty_change_message_shows_mobile_template(self):
         text = change_message(Settings(), 123, [])
