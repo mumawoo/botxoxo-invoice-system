@@ -191,6 +191,61 @@ class ReimbursementExcelTests(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_protected_crop_id_is_not_written_again_when_values_change(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / REIMBURSEMENT_WORKBOOK_NAME
+            crop = root / "review_crops" / "004_2023-10-27_MXN_215.00_Restaurante.jpg"
+            crop.parent.mkdir()
+            crop.write_bytes(b"jpg")
+            store = ReimbursementWorkbook(path)
+            store.write_records(
+                [
+                    InvoiceRecord(
+                        line_no=4,
+                        invoice_date="2026-04-25",
+                        expense_category="Food",
+                        total_amount=215,
+                        seller="Restaurante",
+                        crop_image=str(crop),
+                    )
+                ]
+            )
+            wb = load_workbook(path)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                ws.cell(2, 6).value = "ok"
+                wb.save(path)
+            finally:
+                wb.close()
+
+            store.write_records(
+                [
+                    InvoiceRecord(
+                        line_no=5,
+                        invoice_date="2023-10-27",
+                        expense_category="Food",
+                        total_amount=215,
+                        seller="Restaurante",
+                        crop_image=str(crop),
+                    )
+                ]
+            )
+
+            wb = load_workbook(path, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                rows = [
+                    [ws.cell(row, col).value for col in range(1, 13)]
+                    for row in range(2, ws.max_row + 1)
+                    if any(ws.cell(row, col).value not in (None, "") for col in range(1, 13))
+                ]
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0][0], 4)
+                self.assertEqual(rows[0][5], "ok")
+            finally:
+                wb.close()
+
     def test_deleted_row_is_not_loaded_but_does_not_block_reupload(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / REIMBURSEMENT_WORKBOOK_NAME

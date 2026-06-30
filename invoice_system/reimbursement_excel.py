@@ -671,11 +671,19 @@ def corrected_crop_names(workbook_path: Path) -> set[str]:
 
 
 def _deleted_crop_names(ws) -> set[str]:
+    return _marked_crop_names(ws, _row_is_deleted)
+
+
+def _protected_crop_names(ws) -> set[str]:
+    return _marked_crop_names(ws, _row_is_protected)
+
+
+def _marked_crop_names(ws, predicate) -> set[str]:
     columns = _header_columns(ws)
     link_col = columns.get("Invoice link", 2)
     names: set[str] = set()
     for row_idx in range(2, ws.max_row + 1):
-        if not _row_is_deleted(ws, row_idx):
+        if not predicate(ws, row_idx):
             continue
         cell = ws.cell(row_idx, link_col)
         link = str(cell.hyperlink.target if cell.hyperlink else cell.value or "").strip()
@@ -724,8 +732,8 @@ class ReimbursementWorkbook:
             ws = _ensure_manual_sheet(wb)
             rates = _rates_from_workbook(wb)
             locked_keys = _protected_record_keys(ws, rates)
-            deleted_crops = _deleted_crop_names(ws)
-            return [record for record in records if _record_match_key(record, rates) not in locked_keys and not _record_has_crop_name(record, deleted_crops)]
+            protected_crops = _protected_crop_names(ws)
+            return [record for record in records if _record_match_key(record, rates) not in locked_keys and not _record_has_crop_name(record, protected_crops)]
         finally:
             wb.close()
 
@@ -736,8 +744,8 @@ class ReimbursementWorkbook:
         crop_links = _crop_link_map(wb)
         locked_rows = _protected_rows(ws)
         locked_keys = _protected_record_keys(ws, rates)
-        deleted_crops = _deleted_crop_names(ws)
-        output_records = [record for record in records if _record_match_key(record, rates) not in locked_keys and not _record_has_crop_name(record, deleted_crops)]
+        protected_crops = _protected_crop_names(ws)
+        output_records = [record for record in records if _record_match_key(record, rates) not in locked_keys and not _record_has_crop_name(record, protected_crops)]
         _clear_unlocked_invoice_rows(ws, locked_rows)
 
         write_row = 2
