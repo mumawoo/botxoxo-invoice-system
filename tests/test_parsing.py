@@ -1,13 +1,25 @@
 import unittest
 
 from invoice_system.models import OCRTextLine
-from invoice_system.parsing import extract_amounts, normalize_date, parse_amount, parse_invoice_from_lines
+from invoice_system.parsing import extract_amounts, normalize_date, normalize_receipt_date, parse_amount, parse_invoice_from_lines
 from invoice_system.recognizers import _paddle_lines
 
 
 class ParsingTests(unittest.TestCase):
     def test_normalize_date(self):
         self.assertEqual(normalize_date("Fecha 12/06/2026"), "2026-06-12")
+
+    def test_normalize_receipt_date_uses_mx_day_first_for_ambiguous_dates(self):
+        self.assertEqual(
+            normalize_receipt_date("2026-10-05", raw_date="10/05/2026", currency="MXN", context="Fecha IVA Mexico"),
+            "2026-05-10",
+        )
+
+    def test_normalize_receipt_date_uses_us_month_first_when_context_is_clearly_us(self):
+        self.assertEqual(
+            normalize_receipt_date("10/05/2026", currency="USD", context="Walmart sales tax USA"),
+            "2026-10-05",
+        )
 
     def test_parse_amount_supports_common_mx_formats(self):
         self.assertEqual(parse_amount("$1,234.50 MXN"), 1234.5)

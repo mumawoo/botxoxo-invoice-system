@@ -48,6 +48,18 @@ class WindowsScriptTests(unittest.TestCase):
         self.assertIn("data\\samples\\synthetic_receipts_multi.jpg", text)
         self.assertNotIn("data\\trial", text)
 
+    def test_workbench_has_current_crop_and_pid_controls(self):
+        text = (ROOT / "scripts" / "workbench.ps1").read_text(encoding="utf-8")
+        self.assertIn("Open Crops", text)
+        self.assertIn("Build Checked + Final Crops", text)
+        self.assertIn("Stop Bot PIDs + Close", text)
+        self.assertIn("Show Running PIDs", text)
+        self.assertIn("Start / Restart Auto Scan", text)
+        self.assertIn("Confirm-AndStopExistingInvoiceProcesses", text)
+        self.assertIn("-RestartExisting", text)
+        self.assertIn("-m invoice_system", text)
+        self.assertNotIn("Open Review Crops", text)
+
 
 if __name__ == "__main__":
     unittest.main()

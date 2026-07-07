@@ -47,7 +47,7 @@ class DualOCRTests(unittest.TestCase):
         self.assertFalse(scan.used_codex)
         self.assertEqual(calls, ["easyocr", "paddleocr"])
 
-    def test_runs_both_local_ocr_engines_before_codex_fallback(self):
+    def test_codex_fallback_is_removed_even_when_configured(self):
         calls = []
         resolver = DualOCRResolver(
             RecordingRecognizer(result("paddleocr", amount=120), calls),
@@ -58,8 +58,10 @@ class DualOCRTests(unittest.TestCase):
 
         scan = resolver.scan(Path("dummy.jpg"))
 
-        self.assertTrue(scan.used_codex)
-        self.assertEqual(calls, ["easyocr", "paddleocr", "codex_scan"])
+        self.assertFalse(scan.used_codex)
+        self.assertEqual(calls, ["easyocr", "paddleocr"])
+        self.assertEqual(scan.record.total_amount, 120)
+        self.assertIn("Codex Scan disabled", scan.record.remarks)
 
     def test_uses_best_local_result_when_codex_scan_is_disabled(self):
         calls = []
@@ -116,7 +118,7 @@ class DualOCRTests(unittest.TestCase):
 
         self.assertFalse(scan.used_codex)
 
-    def test_uses_codex_when_amounts_disagree(self):
+    def test_does_not_use_codex_when_amounts_disagree(self):
         resolver = DualOCRResolver(
             StaticRecognizer(result("paddleocr", amount=120)),
             StaticRecognizer(result("easyocr", amount=130)),
@@ -124,11 +126,11 @@ class DualOCRTests(unittest.TestCase):
             _codex_enabled_settings(),
         )
         scan = resolver.scan(Path("dummy.jpg"))
-        self.assertTrue(scan.used_codex)
-        self.assertEqual(scan.record.total_amount, 125)
-        self.assertIn("Codex Scan used", scan.record.remarks)
+        self.assertFalse(scan.used_codex)
+        self.assertEqual(scan.record.total_amount, 120)
+        self.assertIn("Codex Scan disabled", scan.record.remarks)
 
-    def test_uses_codex_when_currency_disagrees(self):
+    def test_does_not_use_codex_when_currency_disagrees(self):
         resolver = DualOCRResolver(
             StaticRecognizer(result("paddleocr", currency="MXN")),
             StaticRecognizer(result("easyocr", currency="USD")),
@@ -138,10 +140,10 @@ class DualOCRTests(unittest.TestCase):
 
         scan = resolver.scan(Path("dummy.jpg"))
 
-        self.assertTrue(scan.used_codex)
+        self.assertFalse(scan.used_codex)
         self.assertEqual(scan.reason, "OCR mismatch")
 
-    def test_uses_codex_when_tax_or_tips_disagree(self):
+    def test_does_not_use_codex_when_tax_or_tips_disagree(self):
         resolver = DualOCRResolver(
             StaticRecognizer(result("paddleocr", vat=16.0, tips=10.0)),
             StaticRecognizer(result("easyocr", vat=20.0, tips=10.0)),
@@ -151,10 +153,10 @@ class DualOCRTests(unittest.TestCase):
 
         scan = resolver.scan(Path("dummy.jpg"))
 
-        self.assertTrue(scan.used_codex)
+        self.assertFalse(scan.used_codex)
         self.assertEqual(scan.reason, "OCR mismatch")
 
-    def test_uses_codex_when_confidence_low(self):
+    def test_does_not_use_codex_when_confidence_low(self):
         resolver = DualOCRResolver(
             StaticRecognizer(result("paddleocr", confidence=0.3)),
             StaticRecognizer(result("easyocr", confidence=0.9)),
@@ -162,9 +164,9 @@ class DualOCRTests(unittest.TestCase):
             _codex_enabled_settings(),
         )
         scan = resolver.scan(Path("dummy.jpg"))
-        self.assertTrue(scan.used_codex)
+        self.assertFalse(scan.used_codex)
 
-    def test_falls_back_to_best_local_when_codex_result_is_invalid(self):
+    def test_does_not_call_codex_even_if_injected_result_would_be_invalid(self):
         codex_text = "CAFE XUAN total 126, but not JSON"
         resolver = DualOCRResolver(
             StaticRecognizer(result("paddleocr", amount=120, confidence=0.8)),
@@ -183,11 +185,10 @@ class DualOCRTests(unittest.TestCase):
 
         self.assertFalse(scan.used_codex)
         self.assertEqual(scan.record.total_amount, 130)
-        self.assertIn("Codex Scan unavailable", scan.record.remarks)
-        self.assertIn("failed validation", scan.record.remarks)
-        self.assertEqual(scan.codex.text, codex_text)
+        self.assertIn("Codex Scan disabled", scan.record.remarks)
+        self.assertIsNone(scan.codex)
 
-    def test_uses_codex_when_image_quality_is_poor_even_if_local_ocr_agrees(self):
+    def test_does_not_use_codex_when_image_quality_is_poor_even_if_local_ocr_agrees(self):
         with tempfile.TemporaryDirectory() as temp:
             image_path = Path(temp) / "flat.jpg"
             _write_flat_image(image_path)
@@ -200,9 +201,9 @@ class DualOCRTests(unittest.TestCase):
 
             scan = resolver.scan(image_path)
 
-            self.assertTrue(scan.used_codex)
+            self.assertFalse(scan.used_codex)
             self.assertEqual(scan.reason, "poor image quality")
-            self.assertEqual(scan.record.total_amount, 125)
+            self.assertEqual(scan.record.total_amount, 120)
 
 
 def _write_flat_image(path: Path) -> None:

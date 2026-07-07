@@ -131,8 +131,8 @@ def _fallback_enabled(settings: Settings, engine: str) -> bool:
     if engine == "qwen_scan":
         return settings.qwen_scan_enabled
     if engine == "codex_scan":
-        return settings.codex_scan_enabled
-    return settings.qwen_scan_enabled or settings.codex_scan_enabled
+        return False
+    return settings.qwen_scan_enabled
 
 
 def _fallback_label(engine: str) -> str:

@@ -42,6 +42,14 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("pass --input or --user-id", stderr.getvalue())
 
+    def test_orientation_ab_test_requires_input_or_user_id(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = main(["orientation-ab-test"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("pass --input or --user-id", stderr.getvalue())
+
     def test_prepare_prints_handoff_summary(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):

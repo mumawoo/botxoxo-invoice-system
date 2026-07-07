@@ -98,6 +98,23 @@ class PipelineHelperTests(unittest.TestCase):
                 self.assertEqual(rotated.getpixel((11, 7)), (255, 0, 0))
             self.assertIn("rotated crop 180deg", note)
 
+    def test_apply_qwen_orientation_uses_qwen_counterclockwise_90_convention(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "crop.png"
+            image = Image.new("RGB", (12, 8), "white")
+            image.putpixel((0, 0), (255, 0, 0))
+            image.save(image_path)
+            result = OCRResult("qwen_scan", rotate_degrees=90, orientation_confidence=0.98)
+
+            note = _apply_qwen_orientation(image_path, result)
+
+            with Image.open(image_path) as rotated:
+                self.assertEqual(rotated.size, (8, 12))
+                self.assertEqual(rotated.getpixel((0, 11)), (255, 0, 0))
+            self.assertIn("rotated crop 90deg", note)
+
     def test_copy_final_crops_removes_stale_generated_files(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -154,29 +171,19 @@ class PipelineHelperTests(unittest.TestCase):
                 self.assertEqual(invoices.cell(2, 1).number_format, "000")
                 self.assertEqual(invoices.cell(2, 9).value, "CAFE XUAN")
                 self.assertEqual(invoices.cell(3, 9).value, "PANADERIA LUZ")
-                self.assertEqual(invoices.cell(2, 2).hyperlink.target, "review_crops/001_2026-06-12_MXN_116.00_CAFE_XUAN.jpg")
+                self.assertEqual(invoices.cell(1, invoices.max_column).value, "Invoice link")
+                self.assertEqual(invoices.cell(2, invoices.max_column).hyperlink.target, "crops/001_2026-06-12_MXN_116.00_CAFE_XUAN.jpg")
             finally:
                 wb.close()
 
-            review_crops = sorted((output / "review_crops").glob("*.jpg"))
+            review_crops = sorted((output / "crops").glob("*.jpg"))
             self.assertEqual(len(review_crops), 2)
             self.assertEqual(review_crops[0].name, "001_2026-06-12_MXN_116.00_CAFE_XUAN.jpg")
             self.assertEqual(review_crops[1].name, "002_2026-06-13_MXN_92.80_PANADERIA_LUZ.jpg")
+            self.assertFalse((output / "review_crops").exists())
 
-            checked = output / CHECKED_WORKBOOK_NAME
-            self.assertTrue(checked.exists())
-            checked_wb = load_workbook(checked, data_only=True)
-            try:
-                checked_ws = checked_wb[INVOICE_EXP_SHEET]
-                self.assertEqual(checked_ws.cell(1, checked_ws.max_column).value, "Invoice link")
-                self.assertEqual(checked_ws.cell(2, checked_ws.max_column).value, "final_crops/food/001_2026-06-12_MXN_116.00_CAFE_XUAN.jpg")
-            finally:
-                checked_wb.close()
-
-            final_crops = sorted((output / "final_crops").rglob("*.jpg"))
-            self.assertEqual(len(final_crops), 2)
-            self.assertEqual(final_crops[0].relative_to(output / "final_crops").as_posix(), "food/001_2026-06-12_MXN_116.00_CAFE_XUAN.jpg")
-            self.assertEqual(final_crops[1].relative_to(output / "final_crops").as_posix(), "food/002_2026-06-13_MXN_92.80_PANADERIA_LUZ.jpg")
+            self.assertFalse((output / CHECKED_WORKBOOK_NAME).exists())
+            self.assertFalse((output / "final_crops").exists())
 
     def test_process_path_removes_stale_raw_crops_before_run(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -406,6 +413,19 @@ class PipelineHelperTests(unittest.TestCase):
 
         self.assertEqual(records[1].invoice_date, "2026-06-12")
         self.assertIn("Missing date filled from nearby receipt", records[1].remarks)
+
+    def test_missing_dates_fall_back_to_source_photo_date(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "photo.jpg"
+            source.write_bytes(b"jpg")
+            records = [
+                InvoiceRecord(invoice_date="", seller="Handwritten", total_amount=150, source_image=str(source)),
+            ]
+
+            _fill_missing_dates_from_neighbors(records)
+
+            self.assertRegex(records[0].invoice_date, r"^\d{4}-\d{2}-\d{2}$")
+            self.assertIn("Missing date filled from source photo date", records[0].remarks)
 
 
 class FakeResolver:

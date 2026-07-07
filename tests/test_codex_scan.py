@@ -1,12 +1,20 @@
 import unittest
+from pathlib import Path
 
-from invoice_system.codex_scan import _extract_json_object, _ocr_result_from_response_text, _record_from_json
+from invoice_system.codex_scan import CodexScanRecognizer, _extract_json_object, _ocr_result_from_response_text, _record_from_json
+from invoice_system.config import Settings
 
 
 JSON_TEXT = '{"invoice_date":"2026-06-12","seller":"CAFE XUAN","total_amount":126,"vat_amount":16,"tips":10}'
 
 
 class CodexScanTests(unittest.TestCase):
+    def test_codex_scan_recognizer_is_removed(self):
+        result = CodexScanRecognizer(Settings(openai_api_key="key", codex_scan_enabled=True)).recognize(Path("receipt.jpg"))
+
+        self.assertIsNone(result.parsed_invoice)
+        self.assertIn("removed", result.error)
+
     def test_record_from_direct_json(self):
         record = _record_from_json(JSON_TEXT)
         self.assertEqual(record.invoice_date, "2026-06-12")
@@ -26,6 +34,32 @@ class CodexScanTests(unittest.TestCase):
         record = _record_from_json('{"invoice_date":"12/06/2026","seller":"CAFE XUAN","total_amount":126}')
 
         self.assertEqual(record.invoice_date, "2026-06-12")
+
+    def test_record_uses_raw_date_to_fix_ambiguous_mx_date(self):
+        record = _record_from_json(
+            '{"invoice_date":"2026-10-05","raw_date":"10/05/2026","currency":"MXN","seller":"Restaurante Mexico","total_amount":126}'
+        )
+
+        self.assertEqual(record.invoice_date, "2026-05-10")
+
+    def test_record_keeps_ambiguous_us_date_month_first(self):
+        record = _record_from_json(
+            '{"invoice_date":"2026-10-05","raw_date":"10/05/2026","currency":"USD","seller":"Walmart","contents":"sales tax","total_amount":12}'
+        )
+
+        self.assertEqual(record.invoice_date, "2026-10-05")
+
+    def test_company_profile_overrides_qwen_category_suggestion(self):
+        record = _record_from_json(
+            '{"invoice_date":"2026-10-05","currency":"USD","seller":"Walmart Supercenter","contents":"groceries","expense_category":"Other","total_amount":12}'
+        )
+
+        self.assertEqual(record.expense_category, "Food")
+
+    def test_record_allows_missing_date_for_neighbor_fill(self):
+        record = _record_from_json('{"seller":"CAFE XUAN","total_amount":126}')
+
+        self.assertEqual(record.invoice_date, "")
 
     def test_record_rejects_missing_required_fields(self):
         with self.assertRaisesRegex(ValueError, "seller"):

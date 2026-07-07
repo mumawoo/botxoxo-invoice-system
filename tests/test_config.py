@@ -69,6 +69,7 @@ class ConfigTests(unittest.TestCase):
                 "TESSERACT_CMD",
                 "TESSERACT_LANG",
                 "TESSERACT_PSM",
+                "COMPANY_PROFILE",
             }
         }
         env["LOCAL_OCR_CONFIDENCE_THRESHOLD"] = "oops"
@@ -81,6 +82,12 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.amount_tolerance, 0.50)
         self.assertEqual(settings.ai_visual_count_min_opencv_crops, 4)
         self.assertEqual(settings.pairing_mode, "auto")
+
+    def test_settings_from_env_reads_company_profile(self):
+        with patch.dict(os.environ, {"COMPANY_PROFILE": "acme"}, clear=True):
+            settings = Settings.from_env()
+
+        self.assertEqual(settings.company_profile, "acme")
 
     def test_settings_from_env_reads_qwen_scan_settings(self):
         env = {
@@ -96,6 +103,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.qwen_model, "qwen-vl-plus")
         self.assertEqual(settings.qwen_base_url, "https://example.test/v1/chat/completions")
         self.assertTrue(settings.qwen_scan_enabled)
+
+    def test_settings_from_env_ignores_removed_openai_fallback(self):
+        env = {
+            "OPENAI_API_KEY": "openai-token",
+            "OPENAI_MODEL": "gpt-4.1",
+            "ENABLE_CODEX_SCAN": "true",
+            "ENABLE_AI_VISUAL_COUNT": "true",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            settings = Settings.from_env()
+
+        self.assertIsNone(settings.openai_api_key)
+        self.assertEqual(settings.openai_model, "")
+        self.assertFalse(settings.codex_scan_enabled)
+        self.assertFalse(settings.ai_visual_count_enabled)
 
     def test_settings_from_env_reads_tesseract_settings(self):
         env = {

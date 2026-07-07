@@ -54,6 +54,9 @@ def build_parser() -> argparse.ArgumentParser:
     fx_update.add_argument("--start-date", default="2025-10-10", help="Start date YYYY-MM-DD.")
     fx_update.add_argument("--end-date", default=None, help="End date YYYY-MM-DD. Defaults to today.")
 
+    rebuild = sub.add_parser("rebuild-final-crops", help="Force rebuild checked Excel and final_crops cache.")
+    rebuild.add_argument("--user-id", type=int, required=True, help="Telegram user ID.")
+
     compare = sub.add_parser("compare", help="Compare Windows output with Ubuntu baseline output.")
     compare.add_argument("--baseline", type=Path, required=True)
     compare.add_argument("--candidate", type=Path, required=True)
@@ -64,6 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
     ab_test.add_argument("--user-id", type=int, default=None, help="Telegram user ID; uses that user's latest/day folder.")
     ab_test.add_argument("--date", default=None, help="Telegram date folder, e.g. 2026-06-16. Defaults to latest.")
     ab_test.add_argument("--output", type=Path, default=Path("data/output/ab_test"), help="A/B output folder.")
+
+    orientation_ab = sub.add_parser("orientation-ab-test", help="Run A/B orientation comparison: local Tesseract vs Qwen.")
+    orientation_ab.add_argument("--input", type=Path, default=None, help="Input folder or image path. Overrides --user-id.")
+    orientation_ab.add_argument("--user-id", type=int, default=None, help="Telegram user ID; prioritizes orientation-problem crops, then latest/day folder.")
+    orientation_ab.add_argument("--date", default=None, help="Telegram date folder, e.g. 2026-07-03. Defaults to latest.")
+    orientation_ab.add_argument("--limit", type=int, default=30, help="Maximum crops to compare.")
+    orientation_ab.add_argument("--output", type=Path, default=Path("data/output/orientation_ab_test"), help="Orientation A/B output folder.")
 
     check = sub.add_parser("check", help="Check installed dependencies, config, and data folders.")
     check.add_argument("--create-dirs", action="store_true", help="Create expected data folders before checking.")
@@ -138,6 +148,23 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "fx":
         return _fx_command(args, settings)
 
+    if args.command == "rebuild-final-crops":
+        from .queue_worker import telegram_user_output_dir
+        from .reimbursement_excel import build_checked_outputs
+
+        try:
+            result = build_checked_outputs(telegram_user_output_dir(settings, args.user_id), force=True)
+        except PermissionError:
+            print("Rebuild error: close the reimbursement/checked Excel file and retry.", file=sys.stderr)
+            return 1
+        print(f"Checked Excel: {result.workbook_path}")
+        print(f"Final crops: {result.final_crops_dir}")
+        print(f"Rows/crops: {result.records_written}/{result.crops_written}")
+        if result.missing_crops:
+            print(f"Missing crops: {len(result.missing_crops)}")
+            return 1
+        return 0
+
     if args.command == "compare":
         try:
             report = compare_outputs(args.baseline, args.candidate, args.output)
@@ -149,6 +176,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "ab-test":
         return _ab_test_command(args, settings)
+
+    if args.command == "orientation-ab-test":
+        return _orientation_ab_test_command(args, settings)
 
     if args.command == "check":
         if args.create_dirs:
@@ -227,6 +257,37 @@ def _ab_test_command(args: argparse.Namespace, settings: Settings) -> int:
     print(f"Qwen rows: {summary.qwen_rows}")
     print(f"Output folder: {summary.output_dir}")
     print(f"Comparison report: {summary.comparison_path}")
+    return 0
+
+
+def _orientation_ab_test_command(args: argparse.Namespace, settings: Settings) -> int:
+    from .orientation_ab_test import orientation_ab_input, prioritized_orientation_inputs, run_orientation_ab_test
+
+    source = args.input
+    source_images = None
+    if source is None:
+        if args.user_id is None:
+            print("Orientation A/B input error: pass --input or --user-id.", file=sys.stderr)
+            return 1
+        source = orientation_ab_input(settings, args.user_id, args.date)
+        source_images = prioritized_orientation_inputs(settings, args.user_id, args.date)
+    if source_images is None and not iter_images(source):
+        print(f"Orientation A/B input error: no invoice photos found in {source}.", file=sys.stderr)
+        return 1
+    if source_images is not None and not source_images:
+        print(f"Orientation A/B input error: no invoice photos found in {source}.", file=sys.stderr)
+        return 1
+    try:
+        summary = run_orientation_ab_test(settings, source, args.output, limit=args.limit, source_images=source_images)
+    except Exception as exc:
+        detail = str(exc).strip() or exc.__class__.__name__
+        print(f"Orientation A/B run error: {detail}", file=sys.stderr)
+        return 1
+    print(f"Orientation A/B source image(s): {summary.source_images}")
+    print(f"Local-orientation crop(s): {summary.local_crops}")
+    print(f"Qwen-orientation crop(s): {summary.qwen_crops}")
+    print(f"Output folder: {summary.output_dir}")
+    print(f"Report: {summary.report_path}")
     return 0
 
 

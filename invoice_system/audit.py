@@ -18,7 +18,6 @@ class AuditItem:
 def audit_requirements(settings: Settings) -> list[AuditItem]:
     checks = run_checks(settings)
     qwen_ready = bool(settings.qwen_api_key)
-    openai_ready = bool(settings.codex_scan_enabled and settings.openai_api_key)
     telegram_ready = bool(settings.telegram_bot_token and settings.telegram_allowed_user_ids)
     trial_photos = iter_images(settings.trial_dir)
     baseline_workbooks = sorted(p for p in settings.baseline_dir.rglob("*.xlsx") if _is_candidate_workbook(p))
@@ -44,11 +43,9 @@ def audit_requirements(settings: Settings) -> list[AuditItem]:
             else "Set QWEN_API_KEY before production scanning.",
         ),
         AuditItem(
-            "Codex Scan fallback",
-            "READY" if openai_ready else "DISABLED",
-            "Codex Scan is enabled and OPENAI_API_KEY is configured."
-            if openai_ready
-            else "Codex/OpenAI fallback is disabled by default.",
+            "OpenAI fallback",
+            "REMOVED",
+            "OpenAI/Codex Scan fallback is no longer used; production OCR is Qwen-only.",
         ),
         AuditItem(
             "Telegram polling ingestion",

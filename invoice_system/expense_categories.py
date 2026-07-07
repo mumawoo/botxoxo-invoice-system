@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unicodedata
+from pathlib import Path
+
+from .company_profile import company_category_override
 
 EXPENSE_CATEGORIES = (
     "Food",
@@ -195,7 +198,12 @@ _CATEGORY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def normalize_expense_category(value: str, evidence: str = "") -> str:
+def normalize_expense_category(value: str, evidence: str = "", *, company_profile: str | None = None, root: Path | None = None) -> str:
+    override = company_category_override(value, evidence, name=company_profile, root=root)
+    if override:
+        known = _known_category(override)
+        if known:
+            return known
     text = " ".join(part for part in (value, evidence) if part)
     normalized = _normalize_text(text).casefold().replace("_", " ")
     for category in EXPENSE_CATEGORIES:
@@ -205,6 +213,14 @@ def normalize_expense_category(value: str, evidence: str = "") -> str:
         if any(_normalize_text(keyword).casefold() in normalized for keyword in keywords):
             return category
     return DEFAULT_EXPENSE_CATEGORY
+
+
+def _known_category(value: str) -> str:
+    normalized = _normalize_text(value).casefold()
+    for category in EXPENSE_CATEGORIES:
+        if _normalize_text(category).casefold() == normalized:
+            return category
+    return ""
 
 
 def _normalize_text(value: str) -> str:

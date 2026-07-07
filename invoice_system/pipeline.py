@@ -11,19 +11,17 @@ from pathlib import Path
 
 from .config import Settings
 from .dual_ocr import DualOCRResolver, ResolvedScan
+from .expense_categories import normalize_expense_category
 from .image_splitter import OpenCVInvoiceSplitter, iter_images
 from .models import CropResult, InvoiceRecord, OCRAuditRow, OCRResult, PipelineSummary, SourceQARecord
 from .pairing import pair_invoice_payment_slips
 from .quality import is_noise_record
 from .qwen_scan import QwenScanRecognizer
 from .reimbursement_excel import (
-    FINAL_CROPS_DIR,
-    REVIEW_CROPS_DIR,
     ReimbursementWorkbook,
     assign_available_line_numbers,
-    build_checked_outputs,
     clear_generated_crops,
-    corrected_crop_names,
+    next_manual_trace_id,
     reimbursement_workbook_path,
 )
 from .visual_count import AIVisualCounter, VisualCountResult
@@ -58,8 +56,6 @@ class InvoicePipeline:
         if not resume:
             _reset_generated_dir(self.crops_dir)
             _remove_state(state_path)
-            self._reset_review_crops()
-            clear_generated_crops(self.output_dir / FINAL_CROPS_DIR)
         else:
             self.crops_dir.mkdir(parents=True, exist_ok=True)
         splitter = OpenCVInvoiceSplitter(self.crops_dir)
@@ -67,7 +63,7 @@ class InvoicePipeline:
         audits = list(state.audits)
         source_qas = list(state.source_qas)
         crop_count = state.crop_count
-        next_crop_id = state.next_crop_id
+        next_crop_id = max(state.next_crop_id, next_manual_trace_id(reimbursement_workbook_path(self.output_dir)))
         completed = set(state.completed_sources)
         source_hashes = set(state.source_hashes)
 
@@ -162,15 +158,8 @@ class InvoicePipeline:
         output_records = pair_invoice_payment_slips(deepcopy(records), mode=self.settings.pairing_mode)
         output_records = store.unlocked_records(output_records)
         assign_available_line_numbers(output_records, store.locked_numbers())
-        _copy_final_crops(output_records, self.output_dir / REVIEW_CROPS_DIR, corrected_crop_names(store.workbook_path))
         result = store.write_records(output_records)
-        build_checked_outputs(self.output_dir)
         return result.rows_written, result.workbook_path
-
-    def _reset_review_crops(self) -> None:
-        workbook_path = reimbursement_workbook_path(self.output_dir)
-        preserve = corrected_crop_names(workbook_path)
-        clear_generated_crops(self.output_dir / REVIEW_CROPS_DIR, preserve)
 
 
 class _PipelineState:
@@ -389,6 +378,13 @@ def _crop_batch_date(image: Path) -> str:
 def _fill_missing_dates_from_neighbors(records: list[InvoiceRecord]) -> None:
     dated_indexes = [index for index, record in enumerate(records) if record.invoice_date.strip()]
     if not dated_indexes:
+        for record in records:
+            fallback_date = _record_source_date(record)
+            if not fallback_date:
+                continue
+            record.invoice_date = fallback_date
+            note = "Missing date filled from source photo date"
+            record.remarks = f"{record.remarks}; {note}" if record.remarks else note
         return
     for index, record in enumerate(records):
         if record.invoice_date.strip():
@@ -400,6 +396,13 @@ def _fill_missing_dates_from_neighbors(records: list[InvoiceRecord]) -> None:
         record.invoice_date = neighbor_date
         note = "Missing date filled from nearby receipt"
         record.remarks = f"{record.remarks}; {note}" if record.remarks else note
+
+
+def _record_source_date(record: InvoiceRecord) -> str:
+    source = str(record.source_image or record.crop_image or "").strip()
+    if source:
+        return _crop_batch_date(Path(source))
+    return date.today().isoformat()
 
 
 def _crop_index(path: Path) -> int:
@@ -436,6 +439,12 @@ class QwenOnlyResolver:
         if result.parsed_invoice is not None:
             orientation_note = _apply_qwen_orientation(image_path, result)
             record = result.parsed_invoice
+            record.expense_category = normalize_expense_category(
+                record.expense_category,
+                f"{record.seller} {record.contents}",
+                company_profile=self.qwen.settings.company_profile,
+                root=self.qwen.settings.root,
+            )
             record.remarks = record.remarks or "Qwen Scan used"
             reason = "qwen scan only"
             if orientation_note:
@@ -459,7 +468,7 @@ def _apply_qwen_orientation(image_path: Path, result: OCRResult) -> str:
 
         with Image.open(image_path) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
-            image = image.rotate(-rotation, expand=True)
+            image = image.rotate(rotation, expand=True)
             image.save(image_path, quality=98)
         return f"qwen rotated crop {rotation}deg {confidence:.2f}"
     except Exception as exc:

@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from invoice_system.image_splitter import (
+    OpenCVInvoiceSplitter,
     iter_images,
     _looks_like_edge_noise,
     _merge_boxes,
@@ -60,6 +61,11 @@ class ImageSplitterTests(unittest.TestCase):
 
         self.assertEqual(_merge_boxes(boxes), [(100, 100, 400, 650)])
 
+    def test_merge_boxes_keeps_side_by_side_receipts_with_misaligned_edges(self):
+        boxes = [(50, 269, 475, 1130), (473, 428, 884, 986)]
+
+        self.assertEqual(_merge_boxes(boxes), [(50, 269, 475, 1130), (473, 428, 884, 986)])
+
     def test_same_receipt_fragment_rejects_diagonal_neighboring_receipts(self):
         self.assertFalse(_same_receipt_fragment((0, 0, 100, 100), (50, 50, 130, 130)))
 
@@ -85,6 +91,26 @@ class ImageSplitterTests(unittest.TestCase):
         self.assertGreaterEqual(min(height, width), 1500)
         self.assertGreater(height, width)
 
+    def test_splitter_uses_paper_regions_when_edge_contours_merge_two_receipts(self):
+        import cv2
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "two_receipts.jpg"
+            image = np.full((900, 650, 3), (90, 55, 25), dtype=np.uint8)
+            cv2.rectangle(image, (70, 80), (570, 330), (245, 245, 240), -1)
+            cv2.rectangle(image, (140, 470), (520, 820), (245, 245, 240), -1)
+            cv2.putText(image, "TOTAL 50.00", (120, 170), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (20, 20, 20), 3)
+            cv2.putText(image, "TOTAL 125.00", (180, 620), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (20, 20, 20), 3)
+            ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            self.assertTrue(ok)
+            encoded.tofile(str(source))
+
+            crops = OpenCVInvoiceSplitter(root / "crops").split(source)
+
+            self.assertEqual(len(crops), 2)
+
     def test_normalize_crop_keeps_portrait_orientation_and_scales(self):
         import cv2
         import numpy as np
@@ -96,6 +122,37 @@ class ImageSplitterTests(unittest.TestCase):
         height, width = normalized.shape[:2]
         self.assertEqual(min(height, width), 1500)
         self.assertGreater(height, width)
+
+    def test_normalize_crop_can_skip_local_text_orientation(self):
+        import cv2
+        import numpy as np
+
+        crop = np.zeros((400, 800, 3), dtype=np.uint8)
+
+        with patch("invoice_system.image_splitter._orient_text_upright", side_effect=AssertionError("should not run")):
+            normalized = _normalize_crop(crop, cv2, local_orientation=False)
+
+        height, width = normalized.shape[:2]
+        self.assertGreaterEqual(min(height, width), 1500)
+        self.assertGreater(height, width)
+
+    def test_splitter_skip_local_orientation_does_not_call_tesseract_orientation(self):
+        import cv2
+        import numpy as np
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "receipt.jpg"
+            image = np.full((500, 900, 3), 255, dtype=np.uint8)
+            cv2.putText(image, "TOTAL 123.45", (80, 220), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 4)
+            ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+            self.assertTrue(ok)
+            encoded.tofile(str(source))
+
+            with patch("invoice_system.image_splitter._orient_text_upright", side_effect=AssertionError("should not run")):
+                crops = OpenCVInvoiceSplitter(root / "crops", local_orientation=False).split(source)
+
+        self.assertEqual(len(crops), 1)
 
     def test_normalize_crop_flips_upside_down_text_when_detectable(self):
         import cv2

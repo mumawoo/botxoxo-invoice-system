@@ -8,13 +8,14 @@ from invoice_system.config import Settings
 from invoice_system.models import InvoiceRecord
 from invoice_system.queue_worker import telegram_user_output_dir, telegram_user_workbook
 from invoice_system.reimbursement import (
+    format_reimbursement_summary,
     reimbursement_path,
     submit_unsubmitted,
     submitted_batches_text,
     sync_reimbursement_records,
     unsubmitted_summary,
 )
-from invoice_system.reimbursement_excel import CHECKED_WORKBOOK_NAME, INVOICE_EXP_SHEET, ReimbursementWorkbook
+from invoice_system.reimbursement_excel import CHECKED_WORKBOOK_NAME, FINAL_CROPS_MANIFEST, INVOICE_EXP_SHEET, ReimbursementWorkbook, build_checked_outputs
 
 
 class ReimbursementTests(unittest.TestCase):
@@ -28,6 +29,29 @@ class ReimbursementTests(unittest.TestCase):
             self.assertEqual(summary.record_count, 2)
             self.assertEqual(summary.total_amount, 300)
             self.assertEqual(summary.category_totals, {"Food": 100, "Gas": 200})
+            text = format_reimbursement_summary(summary)
+            self.assertIn("Date range: 2026-06-12 to 2026-06-13", text)
+            self.assertIn("Days: 2; Food average/day: 50.00 MXN", text)
+
+    def test_report_reads_manual_workbook_even_when_checked_is_stale(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = _settings(Path(temp))
+            _write_reimbursement_workbook(settings, 123)
+            output_dir = telegram_user_output_dir(settings, 123)
+            build_checked_outputs(output_dir)
+            workbook = telegram_user_workbook(settings, 123)
+            wb = load_workbook(workbook)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                ws.cell(2, 3).value = "2026-05-10"
+                wb.save(workbook)
+            finally:
+                wb.close()
+
+            summary = unsubmitted_summary(settings, 123)
+
+            self.assertEqual(summary.date_min, "2026-05-10")
+            self.assertEqual(summary.date_max, "2026-06-13")
 
     def test_submit_archives_active_excel_and_resets_batch(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -36,6 +60,8 @@ class ReimbursementTests(unittest.TestCase):
             output_dir = telegram_user_output_dir(settings, 123)
             index_state = output_dir / "crop_index_state.json"
             index_state.write_text('{"version": 2, "next_crop_id": 2601022}', encoding="utf-8")
+            manifest = output_dir / FINAL_CROPS_MANIFEST
+            manifest.write_text('{"version": 1, "records": {}}', encoding="utf-8")
 
             result = submit_unsubmitted(settings, 123)
 
@@ -43,14 +69,15 @@ class ReimbursementTests(unittest.TestCase):
             self.assertEqual(result.record_count, 2)
             self.assertTrue(result.archived_excel.exists())
             self.assertEqual(result.archived_excel.name, CHECKED_WORKBOOK_NAME)
-            self.assertTrue((result.archived_crops / "food" / "001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
-            self.assertTrue((result.archived_crops / "other" / "002_2026-06-13_MXN_200.00_Pemex.jpg").exists())
+            self.assertTrue((result.archived_crops / "food" / "001_trace001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
+            self.assertTrue((result.archived_crops / "other" / "002_trace002_2026-06-13_MXN_200.00_Pemex.jpg").exists())
             self.assertTrue(result.archived_manual_excel.exists())
             self.assertTrue((result.archived_review_crops / "001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
             self.assertFalse(telegram_user_workbook(settings, 123).exists())
             self.assertFalse((output_dir / "final_crops").exists())
             self.assertFalse((output_dir / "review_crops").exists())
             self.assertFalse(index_state.exists())
+            self.assertFalse(manifest.exists())
             self.assertIn("SUB-", result.batch_id)
             self.assertIn(result.batch_id, submitted_batches_text(settings, 123))
 

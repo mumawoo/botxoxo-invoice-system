@@ -3,15 +3,22 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
 from .config import Settings
-from .excel_store import load_invoice_records
 from .queue_worker import telegram_user_output_dir, telegram_user_workbook
-from .reimbursement_excel import REVIEW_CROPS_DIR, build_checked_outputs, checked_workbook_path, rerun_checked_from_finance_edits
+from .reimbursement_excel import (
+    CROPS_DIR,
+    FINAL_CROPS_MANIFEST,
+    REVIEW_CROPS_DIR,
+    build_checked_outputs,
+    checked_workbook_path,
+    load_reimbursement_records,
+    rerun_checked_from_finance_edits,
+)
 
 REIMBURSEMENT_FILE = "Reimbursement_Status.xlsx"
 ACTIVE_BATCH_FILE = "active_batch_id.txt"
@@ -75,7 +82,6 @@ def rerun_finance_edits(settings: Settings, user_id: int):
 
 
 def unsubmitted_summary(settings: Settings, user_id: int) -> ReimbursementSummary:
-    refresh_checked_outputs(settings, user_id)
     records = _active_records(settings, user_id)
     category_totals: dict[str, float] = {}
     total = 0.0
@@ -166,12 +172,47 @@ def format_reimbursement_summary(summary: ReimbursementSummary, title: str = "Re
     ]
     if summary.date_min or summary.date_max:
         lines.append(f"Date range: {summary.date_min or '-'} to {summary.date_max or '-'}")
+        days = summary_period_days(summary)
+        if days:
+            lines.append(f"Days: {days}; Food average/day: {summary_food_average_per_day(summary):.2f} MXN")
     if summary.category_totals:
         lines.append("Category totals:")
         for category, amount in sorted(summary.category_totals.items()):
             lines.append(f"- {category}: {amount:.2f}")
     lines.append(f"Failed photos: {summary.failed_count}")
     return "\n".join(lines)
+
+
+def summary_period_days(summary: ReimbursementSummary) -> int:
+    start = _parse_summary_date(summary.date_min)
+    end = _parse_summary_date(summary.date_max)
+    if start is None and end is None:
+        return 0
+    start = start or end
+    end = end or start
+    if start is None or end is None:
+        return 0
+    if end < start:
+        start, end = end, start
+    return (end - start).days + 1
+
+
+def summary_food_average_per_day(summary: ReimbursementSummary) -> float:
+    days = summary_period_days(summary)
+    if days <= 0:
+        return 0.0
+    food_total = float(summary.category_totals.get("Food", 0.0) or 0.0)
+    return round(food_total / days, 2)
+
+
+def _parse_summary_date(value: str) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError:
+        return None
 
 
 def format_submit_result(result: SubmitResult | None) -> str:
@@ -207,10 +248,7 @@ def active_scan_batch_id(output_dir: Path) -> str:
 
 
 def _active_records(settings: Settings, user_id: int):
-    output_dir = telegram_user_output_dir(settings, user_id)
-    checked = checked_workbook_path(output_dir)
-    source = checked if checked.exists() else telegram_user_workbook(settings, user_id)
-    return [record for record in load_invoice_records(source) if record.total_amount > 0]
+    return [record for record in load_reimbursement_records(telegram_user_workbook(settings, user_id)) if record.total_amount > 0]
 
 
 def _record_totals(records) -> tuple[float, dict[str, float]]:
@@ -250,12 +288,14 @@ def _archive_active_outputs(settings: Settings, user_id: int, batch_id: str) -> 
     workbook = checked_workbook_path(output_dir)
     manual_workbook = telegram_user_workbook(settings, user_id)
     final_crops = output_dir / "final_crops"
+    crops = output_dir / CROPS_DIR
     review_crops = output_dir / REVIEW_CROPS_DIR
     archive_dir = output_dir / "submitted" / batch_id
     archive_dir.mkdir(parents=True, exist_ok=True)
     archived_excel = archive_dir / workbook.name
     archived_crops = archive_dir / "final_crops"
     archived_manual_excel = archive_dir / "manual_check" / manual_workbook.name
+    archived_manual_crops = archive_dir / "manual_check" / CROPS_DIR
     archived_review_crops = archive_dir / "manual_check" / REVIEW_CROPS_DIR
     if workbook.exists():
         shutil.copy2(workbook, archived_excel)
@@ -269,12 +309,19 @@ def _archive_active_outputs(settings: Settings, user_id: int, batch_id: str) -> 
         archived_manual_excel.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(manual_workbook, archived_manual_excel)
         manual_saved = archived_manual_excel
+    if crops.exists():
+        if archived_manual_crops.exists():
+            shutil.rmtree(archived_manual_crops)
+        archived_manual_crops.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(crops, archived_manual_crops)
+        review_saved = archived_manual_crops
     if review_crops.exists():
         if archived_review_crops.exists():
             shutil.rmtree(archived_review_crops)
         archived_review_crops.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(review_crops, archived_review_crops)
-        review_saved = archived_review_crops
+        if review_saved is None:
+            review_saved = archived_review_crops
     for name in ("processing_state.json", "queue_state.json"):
         path = output_dir / name
         if path.exists():
@@ -293,6 +340,7 @@ def _reset_active_scan_outputs(settings: Settings, user_id: int) -> None:
         "Invoice_Manually_Checked.xlsx",
         "processing_state.json",
         "crop_index_state.json",
+        FINAL_CROPS_MANIFEST,
         ACTIVE_BATCH_FILE,
     )
     for name in names:

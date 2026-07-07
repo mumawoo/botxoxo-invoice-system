@@ -56,6 +56,37 @@ class PairingTests(unittest.TestCase):
         self.assertEqual(paired[0].total_amount, 126)
         self.assertEqual(paired[0].tips, 10)
 
+    def test_merges_no_vat_restaurant_receipt_with_bank_tip_slip(self):
+        invoice = InvoiceRecord(
+            invoice_date="2026-05-09",
+            seller="SUSHI ROLL S.A. DE C.V.",
+            currency="MXN",
+            total_amount=566,
+            expense_amount=566,
+            contents="1 PEPSI LIGHT, 1 TEPPANYAKI MIX ESP, 1 MATCHA CAKE",
+            remarks="Mesa # 65, 1 Personas, Atendio: Roman Bautista",
+            crop_image="030.jpg",
+        )
+        payment = InvoiceRecord(
+            invoice_date="2026-05-09",
+            seller="MIFEL SUSHI ROLL CUMBRES",
+            currency="MXN",
+            total_amount=622.6,
+            expense_amount=566,
+            tips=56.6,
+            contents="SUSHI ROLL CUMBRES",
+            remarks="VENTA CON PROPINA, Monterrey NL, CREDITO/HSBC MEX/MASTERCARD",
+            crop_image="031.jpg",
+        )
+
+        paired = pair_invoice_payment_slips([invoice, payment])
+
+        self.assertEqual(len(paired), 1)
+        self.assertEqual(paired[0].seller, "SUSHI ROLL S.A. DE C.V.")
+        self.assertEqual(paired[0].total_amount, 622.6)
+        self.assertEqual(paired[0].tips, 56.6)
+        self.assertEqual(paired[0].supporting_crop_images, ["031.jpg"])
+
     def test_pairs_payment_slip_with_normalized_date_seller_and_currency(self):
         seller = "Caf" + chr(0xE9) + " Xu" + chr(0xE1) + "n"
         invoice = InvoiceRecord(
@@ -81,9 +112,17 @@ class PairingTests(unittest.TestCase):
         self.assertEqual(paired[0].tips, 10)
         self.assertIn("Combined payment slip", paired[0].remarks)
 
-    def test_removes_duplicate_payment_slip_when_amounts_match(self):
+    def test_does_not_merge_same_amount_without_payment_hint(self):
         invoice = InvoiceRecord(invoice_date="2026-06-12", seller="CAFE XUAN", currency="MXN", total_amount=116, vat_amount=16)
         payment = InvoiceRecord(invoice_date="2026-06-12", seller="CAFE XUAN", currency="MXN", total_amount=116)
+
+        paired = pair_invoice_payment_slips([invoice, payment])
+
+        self.assertEqual(len(paired), 2)
+
+    def test_merges_same_amount_when_payment_hint_is_present(self):
+        invoice = InvoiceRecord(invoice_date="2026-06-12", seller="CAFE XUAN", currency="MXN", total_amount=116, vat_amount=16)
+        payment = InvoiceRecord(invoice_date="2026-06-12", seller="CAFE XUAN", currency="MXN", total_amount=116, contents="card payment")
 
         paired = pair_invoice_payment_slips([invoice, payment])
 
@@ -107,7 +146,7 @@ class PairingTests(unittest.TestCase):
 
         self.assertEqual(len(paired), 2)
 
-    def test_removes_duplicate_invoice_photo_when_contents_match(self):
+    def test_marks_only_new_same_content_record_as_possible_duplicate(self):
         first = InvoiceRecord(
             invoice_date="2026-06-12",
             seller="CAFE XUAN",
@@ -127,10 +166,11 @@ class PairingTests(unittest.TestCase):
 
         paired = pair_invoice_payment_slips([first, duplicate])
 
-        self.assertEqual(len(paired), 1)
-        self.assertIn("Duplicate invoice photo removed", paired[0].remarks)
+        self.assertEqual(len(paired), 2)
+        self.assertNotIn("Possible duplicate", paired[0].remarks)
+        self.assertIn("Possible duplicate", paired[1].remarks)
 
-    def test_keeps_same_amount_invoice_when_contents_differ(self):
+    def test_marks_new_same_amount_invoice_when_contents_differ(self):
         first = InvoiceRecord(
             invoice_date="2026-06-12",
             seller="CAFE XUAN",
@@ -151,6 +191,8 @@ class PairingTests(unittest.TestCase):
         paired = pair_invoice_payment_slips([first, second])
 
         self.assertEqual(len(paired), 2)
+        self.assertNotIn("Possible duplicate", paired[0].remarks)
+        self.assertIn("Possible duplicate", paired[1].remarks)
 
     def test_review_mode_marks_possible_pair_without_merging_or_deleting(self):
         payment = InvoiceRecord(

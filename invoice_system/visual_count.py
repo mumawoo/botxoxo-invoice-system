@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from .codex_scan import _base64, _collect_output_text, _extract_json_object, _mime_type
+from .codex_scan import _extract_json_object
 from .config import Settings
 
 
@@ -30,31 +30,7 @@ class AIVisualCounter:
         self.settings = settings
 
     def count(self, image_path: Path) -> VisualCountResult:
-        if not self.settings.ai_visual_count_enabled:
-            return VisualCountResult(None, reason="AI visual count disabled")
-        if not self.settings.openai_api_key:
-            return VisualCountResult(None, error="OPENAI_API_KEY is not configured")
-        try:
-            from openai import OpenAI
-
-            client = OpenAI(api_key=self.settings.openai_api_key)
-            image_url = f"data:{_mime_type(image_path)};base64,{_base64(image_path)}"
-            response = client.responses.create(
-                model=self.settings.openai_model,
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": COUNT_PROMPT},
-                            {"type": "input_image", "image_url": image_url},
-                        ],
-                    }
-                ],
-            )
-            text = getattr(response, "output_text", "") or _collect_output_text(response)
-            return _parse_visual_count(text)
-        except Exception as exc:
-            return VisualCountResult(None, error=str(exc))
+        return VisualCountResult(None, reason="OpenAI visual count removed; OpenCV crop count is used")
 
 
 def _parse_visual_count(text: str) -> VisualCountResult:

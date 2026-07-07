@@ -26,7 +26,7 @@ class AuditTests(unittest.TestCase):
 
             self.assertIn("[WAITING] Qwen-only invoice recognition", text)
             self.assertIn("[WAITING] Qwen Scan credentials", text)
-            self.assertIn("[DISABLED] Codex Scan fallback", text)
+            self.assertIn("[REMOVED] OpenAI fallback", text)
             self.assertIn("[WAITING] Telegram polling ingestion", text)
             self.assertIn("[WAITING] Ubuntu comparison run", text)
             self.assertIn("trial photos=0", text)

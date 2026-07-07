@@ -22,6 +22,7 @@ class QwenScanTests(unittest.TestCase):
                         "content": json.dumps(
                             {
                                 "invoice_date": "2026-06-12",
+                                "raw_date": "12/06/2026",
                                 "expense_category": "餐饮",
                                 "contents": "Comida",
                                 "currency": "MXN",
@@ -60,6 +61,41 @@ class QwenScanTests(unittest.TestCase):
         self.assertEqual(result.parsed_invoice.total_amount, 126.0)
         self.assertEqual(result.rotate_degrees, 180)
         self.assertEqual(result.orientation_confidence, 0.97)
+
+    def test_qwen_recognize_uses_raw_date_for_ambiguous_mx_receipt(self):
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "invoice_date": "2026-10-05",
+                                "raw_date": "10/05/2026",
+                                "currency": "MXN",
+                                "total_amount": 126,
+                                "seller": "Restaurante Mexico",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "receipt.jpg"
+            _write_test_image(image)
+            recognizer = QwenScanRecognizer(
+                Settings(
+                    qwen_api_key="token",
+                    qwen_scan_enabled=True,
+                    qwen_base_url="https://example.test/chat/completions",
+                )
+            )
+
+            with patch("invoice_system.qwen_scan.urllib.request.urlopen", return_value=FakeResponse(response)):
+                result = recognizer.recognize(image)
+
+        self.assertEqual(result.error, "")
+        self.assertEqual(result.parsed_invoice.invoice_date, "2026-05-10")
 
 
 class FakeResponse:

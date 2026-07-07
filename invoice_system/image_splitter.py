@@ -19,8 +19,9 @@ def iter_images(path: Path) -> list[Path]:
 
 
 class OpenCVInvoiceSplitter:
-    def __init__(self, crops_dir: Path) -> None:
+    def __init__(self, crops_dir: Path, *, local_orientation: bool = True) -> None:
         self.crops_dir = crops_dir
+        self.local_orientation = local_orientation
         self.crops_dir.mkdir(parents=True, exist_ok=True)
 
     def split(self, image_path: Path) -> list[CropResult]:
@@ -53,6 +54,9 @@ class OpenCVInvoiceSplitter:
                 boxes.append(box)
 
         boxes = _merge_boxes(boxes)
+        paper_boxes = _paper_region_boxes(image, cv2, np)
+        if len(paper_boxes) > len(boxes) and (len(boxes) <= 1 or _box_area(boxes[0]) >= image_area * 0.18):
+            boxes = paper_boxes
         if not boxes:
             return [self._copy_original(image_path, 1)]
 
@@ -61,7 +65,7 @@ class OpenCVInvoiceSplitter:
         for index, box in enumerate(boxes, start=1):
             x1, y1, x2, y2 = _pad_box(box, width, height, 0.15)
             crop = image[y1:y2, x1:x2]
-            crop = _normalize_crop(crop, cv2)
+            crop = _normalize_crop(crop, cv2, local_orientation=self.local_orientation)
             out = self.crops_dir / f"{image_path.stem}_d{index:02d}.jpg"
             ok, encoded = cv2.imencode(".jpg", crop, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
             if ok:
@@ -78,7 +82,7 @@ class OpenCVInvoiceSplitter:
             image = _read_image_with_exif_orientation(image_path, cv2, np)
             if image is None:
                 raise ValueError("image decode failed")
-            image = _normalize_crop(image, cv2)
+            image = _normalize_crop(image, cv2, local_orientation=self.local_orientation)
             ok, encoded = cv2.imencode(".jpg", image, [int(cv2.IMWRITE_JPEG_QUALITY), 98])
             if not ok:
                 raise ValueError("jpeg encode failed")
@@ -147,6 +151,8 @@ def _same_receipt_fragment(a: tuple[int, int, int, int], b: tuple[int, int, int,
     height_ratio = min(ah, bh) / max(ah, bh)
     vertical_gap = _axis_gap(a[1], a[3], b[1], b[3])
     horizontal_gap = _axis_gap(a[0], a[2], b[0], b[2])
+    top_delta = abs(a[1] - b[1])
+    bottom_delta = abs(a[3] - b[3])
 
     same_column_slice = (
         horizontal_overlap >= 0.72
@@ -156,9 +162,11 @@ def _same_receipt_fragment(a: tuple[int, int, int, int], b: tuple[int, int, int,
     )
     same_row_slice = (
         vertical_overlap >= 0.72
-        and height_ratio >= 0.62
+        and height_ratio >= 0.82
         and y_center_delta <= max(ah, bh) * 0.18
         and horizontal_gap <= min(aw, bw) * 0.12
+        and top_delta <= max(ah, bh) * 0.14
+        and bottom_delta <= max(ah, bh) * 0.14
     )
     return same_column_slice or same_row_slice
 
@@ -209,6 +217,27 @@ def _looks_like_edge_noise(box: tuple[int, int, int, int], image_width: int, ima
     return touches_bottom and short_strip and very_wide
 
 
+def _paper_region_boxes(image, cv2, np) -> list[tuple[int, int, int, int]]:
+    height, width = image.shape[:2]
+    image_area = height * width
+    if image_area <= 0:
+        return []
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (0, 0, 125), (180, 85, 255))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes: list[tuple[int, int, int, int]] = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        area = w * h
+        box = (x, y, x + w, y + h)
+        if image_area * 0.02 <= area <= image_area * 0.70 and w > 80 and h > 80 and not _looks_like_edge_noise(box, width, height):
+            boxes.append(box)
+    return _merge_boxes(boxes)
+
+
 def _pad_box(box: tuple[int, int, int, int], width: int, height: int, ratio: float) -> tuple[int, int, int, int]:
     x1, y1, x2, y2 = box
     pad_x = int((x2 - x1) * ratio)
@@ -228,21 +257,22 @@ def _read_image_with_exif_orientation(image_path: Path, cv2, np):
         return cv2.imdecode(np.fromfile(str(image_path), dtype=np.uint8), cv2.IMREAD_COLOR)
 
 
-def _normalize_crop(crop, cv2):
+def _normalize_crop(crop, cv2, *, local_orientation: bool = True):
     h, w = crop.shape[:2]
     if w > h:
         clockwise = cv2.rotate(crop, cv2.ROTATE_90_CLOCKWISE)
         counterclockwise = cv2.rotate(crop, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        crop = _orient_text_upright(_choose_more_upright(clockwise, counterclockwise, cv2), cv2)
+        crop = _orient_text_upright(_choose_more_upright(clockwise, counterclockwise, cv2), cv2) if local_orientation else clockwise
         h, w = crop.shape[:2]
-    else:
+    elif local_orientation:
         crop = _orient_text_upright(crop, cv2)
         h, w = crop.shape[:2]
     minimum = min(h, w)
     if minimum < 1500 and minimum > 0:
         scale = 1500 / minimum
         crop = cv2.resize(crop, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-        crop = _orient_text_upright(crop, cv2)
+        if local_orientation:
+            crop = _orient_text_upright(crop, cv2)
     return crop
 
 

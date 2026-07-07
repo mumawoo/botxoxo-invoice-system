@@ -54,6 +54,88 @@ def normalize_date(value: str) -> str:
     return ""
 
 
+def normalize_receipt_date(value: str, *, raw_date: str = "", currency: str = "", context: str = "") -> str:
+    """Normalize receipt dates with a country-aware tie break for ambiguous numeric dates."""
+    raw = (raw_date or "").strip()
+    if raw:
+        normalized = _normalize_contextual_numeric_date(raw, currency=currency, context=context)
+        if normalized:
+            return normalized
+    text = (value or "").strip()
+    normalized = _normalize_contextual_numeric_date(text, currency=currency, context=context)
+    return normalized or normalize_date(text)
+
+
+def _normalize_contextual_numeric_date(value: str, *, currency: str = "", context: str = "") -> str:
+    match = DATE_RE.search(value or "")
+    if not match:
+        return ""
+    raw = match.group(1)
+    if re.match(r"^\d{4}[-/]\d{1,2}[-/]\d{1,2}$", raw):
+        return normalize_date(raw)
+    parts = re.split(r"[-/]", raw)
+    if len(parts) != 3:
+        return ""
+    first, second, year_text = parts
+    try:
+        first_num = int(first)
+        second_num = int(second)
+        year_num = int(year_text)
+    except ValueError:
+        return ""
+    if year_num < 100:
+        year_num += 2000 if year_num < 70 else 1900
+    if first_num > 12:
+        return _date_from_parts(year_num, second_num, first_num)
+    if second_num > 12:
+        return _date_from_parts(year_num, first_num, second_num)
+    if _prefer_us_month_first(currency, context):
+        return _date_from_parts(year_num, first_num, second_num)
+    return _date_from_parts(year_num, second_num, first_num)
+
+
+def _prefer_us_month_first(currency: str, context: str) -> bool:
+    normalized_currency = normalize_text(currency).casefold()
+    normalized_context = normalize_text(context).casefold()
+    if normalized_currency in {"mxn", "m.n.", "mn", "peso", "pesos"}:
+        return False
+    spanish_or_mexico = (
+        "fecha",
+        "mexico",
+        "méxico",
+        "m.n.",
+        "rfc",
+        "iva",
+        "propina",
+        "factura",
+        "ticket",
+    )
+    if any(keyword in normalized_context for keyword in spanish_or_mexico):
+        return False
+    us_markers = (
+        " usd",
+        "dollar",
+        "sales tax",
+        "subtotal",
+        "united states",
+        " usa",
+        "walmart",
+        "target",
+        "mcdonald",
+        "trader joe",
+        "whole foods",
+        "starbucks",
+    )
+    return normalized_currency == "usd" or any(keyword in f" {normalized_context}" for keyword in us_markers)
+
+
+def _date_from_parts(year: int, month: int, day: int) -> str:
+    try:
+        return datetime(year, month, day).date().isoformat()
+    except ValueError:
+        return ""
+
+
 def parse_amount(value: str) -> float:
     if not value:
         return 0.0

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
 from difflib import SequenceMatcher
+from pathlib import Path
 
 from .models import InvoiceRecord
-from .parsing import fuzzy_match, normalize_date, normalize_text
+from .parsing import normalize_date, normalize_text
 
 PAYMENT_HINT_KEYWORDS = (
     "tip",
@@ -18,6 +20,65 @@ PAYMENT_HINT_KEYWORDS = (
     "mastercard",
     "amex",
 )
+
+BANK_OR_PAYMENT_WORDS = {
+    "afirme",
+    "amex",
+    "banamex",
+    "banca",
+    "banco",
+    "bancomer",
+    "banorte",
+    "bbva",
+    "card",
+    "credito",
+    "credit",
+    "debit",
+    "debito",
+    "hsbc",
+    "mastercard",
+    "mercado",
+    "mifel",
+    "pago",
+    "payment",
+    "propina",
+    "santander",
+    "tarjeta",
+    "visa",
+}
+
+MERCHANT_STOP_WORDS = BANK_OR_PAYMENT_WORDS | {
+    "and",
+    "at",
+    "caja",
+    "city",
+    "con",
+    "cv",
+    "cumbres",
+    "de",
+    "del",
+    "el",
+    "en",
+    "est",
+    "estado",
+    "la",
+    "las",
+    "los",
+    "mex",
+    "mexico",
+    "monterrey",
+    "mx",
+    "nl",
+    "para",
+    "por",
+    "restaurante",
+    "restaurant",
+    "sa",
+    "sucursal",
+    "the",
+    "venta",
+    "y",
+}
 
 
 def pair_invoice_payment_slips(records: list[InvoiceRecord], mode: str = "auto") -> list[InvoiceRecord]:
@@ -43,7 +104,8 @@ def pair_invoice_payment_slips(records: list[InvoiceRecord], mode: str = "auto")
         _merge_payment_slip(record, payment)
 
     output = [record for index, record in enumerate(records) if index not in paired_payment_indexes]
-    return _deduplicate_invoices(output)
+    _mark_possible_duplicate_invoices(output)
+    return output
 
 
 def _suggest_pairs_for_review(records: list[InvoiceRecord]) -> list[InvoiceRecord]:
@@ -126,7 +188,7 @@ def _same_context(left: InvoiceRecord, right: InvoiceRecord) -> bool:
     return (
         _same_date(left.invoice_date, right.invoice_date)
         and _same_currency(left.currency, right.currency)
-        and _merchant_score(left.seller, right.seller) >= 0.80
+        and _same_merchant_context(left, right)
     )
 
 
@@ -148,11 +210,15 @@ def _normalize_currency(value: str) -> str:
 
 
 def _looks_like_invoice(record: InvoiceRecord) -> bool:
-    return record.total_amount > 0 and record.vat_amount > 0
+    if record.total_amount <= 0:
+        return False
+    if record.vat_amount > 0 or record.sales_tax > 0:
+        return True
+    return not _looks_like_strong_payment_slip(record) and bool(_merchant_tokens(record))
 
 
 def _looks_like_payment_slip(record: InvoiceRecord) -> bool:
-    return record.total_amount > 0 and record.vat_amount <= 0 and record.sales_tax <= 0
+    return record.total_amount > 0 and record.vat_amount <= 0 and record.sales_tax <= 0 and _looks_like_strong_payment_slip(record)
 
 
 def _confident_payment_pair(invoice: InvoiceRecord, payment: InvoiceRecord) -> bool:
@@ -181,6 +247,35 @@ def _has_payment_hint(record: InvoiceRecord) -> bool:
     return any(keyword in text for keyword in PAYMENT_HINT_KEYWORDS)
 
 
+def _looks_like_strong_payment_slip(record: InvoiceRecord) -> bool:
+    if record.total_amount <= 0 or record.vat_amount > 0 or record.sales_tax > 0:
+        return False
+    text = normalize_text(" ".join([record.seller, record.contents, record.remarks])).casefold()
+    return _has_payment_hint(record) or any(word in text for word in BANK_OR_PAYMENT_WORDS)
+
+
+def _same_merchant_context(left: InvoiceRecord, right: InvoiceRecord) -> bool:
+    if _merchant_score(left.seller, right.seller) >= 0.80:
+        return True
+    if _merchant_score(_merchant_clean_text(left), _merchant_clean_text(right)) >= 0.80:
+        return True
+    shared = _merchant_tokens(left) & _merchant_tokens(right)
+    if len(shared) >= 2:
+        return True
+    return any(len(token) >= 6 for token in shared)
+
+
+def _merchant_clean_text(record: InvoiceRecord) -> str:
+    tokens = _merchant_tokens(record)
+    return " ".join(sorted(tokens))
+
+
+def _merchant_tokens(record: InvoiceRecord) -> set[str]:
+    text = normalize_text(" ".join([record.seller, record.contents, record.remarks])).casefold()
+    tokens = set(re.findall(r"[a-z0-9]+", text))
+    return {token for token in tokens if len(token) >= 3 and token not in MERCHANT_STOP_WORDS}
+
+
 def _merchant_score(left: str, right: str) -> float:
     a = normalize_text(left).casefold()
     b = normalize_text(right).casefold()
@@ -203,21 +298,26 @@ def _append_supporting_crop(record: InvoiceRecord, crop_image: str) -> None:
         record.supporting_crop_images.append(crop_text)
 
 
-def _deduplicate_invoices(records: list[InvoiceRecord]) -> list[InvoiceRecord]:
+def _mark_possible_duplicate_invoices(records: list[InvoiceRecord]) -> None:
     seen: dict[tuple[object, ...], InvoiceRecord] = {}
-    output: list[InvoiceRecord] = []
     for record in records:
         key = _duplicate_key(record)
         existing = seen.get(key)
-        if existing is not None and _contents_match_for_duplicate(existing, record):
-            _append_remark(existing, "Duplicate invoice photo removed")
-            _append_supporting_crop(existing, record.crop_image)
-            for crop_image in getattr(record, "supporting_crop_images", []) or []:
-                _append_supporting_crop(existing, crop_image)
+        if existing is None:
+            seen[key] = record
             continue
-        seen[key] = record
-        output.append(record)
-    return output
+        if not _possible_duplicate(existing, record):
+            continue
+        existing_id = _record_trace_label(existing)
+        _append_remark(record, f"Possible duplicate with {existing_id}; human review required")
+
+
+def _possible_duplicate(left: InvoiceRecord, right: InvoiceRecord) -> bool:
+    if _duplicate_key(left) != _duplicate_key(right):
+        return False
+    left_id = _record_trace_key(left)
+    right_id = _record_trace_key(right)
+    return not (left_id and right_id and left_id == right_id)
 
 
 def _duplicate_key(record: InvoiceRecord) -> tuple[object, ...]:
@@ -226,15 +326,23 @@ def _duplicate_key(record: InvoiceRecord) -> tuple[object, ...]:
         normalize_text(record.seller).casefold(),
         _normalize_currency(record.currency),
         round(record.total_amount, 2),
-        round(record.vat_amount, 2),
-        round(record.sales_tax, 2),
-        round(record.tips, 2),
     )
 
 
-def _contents_match_for_duplicate(left: InvoiceRecord, right: InvoiceRecord) -> bool:
-    left_contents = normalize_text(left.contents).casefold()
-    right_contents = normalize_text(right.contents).casefold()
-    if not left_contents or not right_contents:
-        return False
-    return left_contents == right_contents or fuzzy_match(left_contents, right_contents, threshold=0.88)
+def _record_trace_label(record: InvoiceRecord) -> str:
+    trace = _record_trace_key(record)
+    return trace or "another crop"
+
+
+def _record_trace_key(record: InvoiceRecord) -> str:
+    trace = _trace_from_path(record.crop_image)
+    if trace:
+        return trace
+    if record.line_no:
+        return f"{record.line_no:03d}"
+    return ""
+
+
+def _trace_from_path(value: str) -> str:
+    match = re.match(r"(\d{3,})[a-zA-Z]?_", Path(str(value or "")).name)
+    return match.group(1) if match else ""

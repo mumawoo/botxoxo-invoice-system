@@ -26,6 +26,11 @@ class ExpenseCategoryTests(unittest.TestCase):
         self.assertEqual(normalize_expense_category("restaurant"), "Food")
         self.assertEqual(normalize_expense_category("food_and_beverage"), "Food")
         self.assertEqual(normalize_expense_category("Food & Beverage"), "Food")
+        self.assertEqual(normalize_expense_category("", "Codie"), "Food")
+        self.assertEqual(normalize_expense_category("", "CORDIA CAFE Y PLANTAS"), "Food")
+        self.assertEqual(normalize_expense_category("", "cordial"), "Food")
+        self.assertEqual(normalize_expense_category("", "Walmart"), "Food")
+        self.assertEqual(normalize_expense_category("", "WAL-MART Supercenter"), "Food")
         self.assertEqual(normalize_expense_category("餐饮"), "Food")
 
     def test_normalizes_common_business_categories(self):

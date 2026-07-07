@@ -1,28 +1,34 @@
 import tempfile
 import unittest
 import json
-from datetime import datetime
+import os
+import subprocess
+import sys
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
 
 from invoice_system.config import Settings
 from invoice_system.models import InvoiceRecord, PipelineSummary
-from invoice_system.queue_worker import DONE, QueueItem, save_queue_state, telegram_user_queue_path, telegram_user_workbook, QueueState
+from invoice_system.grouping import mark_source_for_group_if_armed
+from invoice_system.queue_worker import DONE, PENDING, QueueItem, load_queue_state, save_queue_state, telegram_user_queue_path, telegram_user_workbook, QueueState
 from invoice_system.reimbursement_excel import INVOICE_EXP_SHEET, ReimbursementWorkbook
 from invoice_system.telegram_bot import (
     append_process_status,
     change_message,
     delete_message,
     format_telegram_config,
+    group_message,
     is_allowed_user,
     processing_failure_message,
     processing_success_message,
     queued_photo_message,
     recent_message,
+    report_message,
     resolve_auto_process,
     review_crop_paths,
-    rerun_message,
+    rollback_message,
     saved_photo_message,
     scan_completion_message,
     set_user_language,
@@ -32,12 +38,14 @@ from invoice_system.telegram_bot import (
     telegram_batch_source,
     telegram_command_menu,
     telegram_config_ready,
+    telegram_image_document_filename,
     telegram_help_message,
     telegram_photo_filename,
     telegram_polling_ready,
     telegram_start_message,
     user_language,
     whoami_message,
+    is_supported_telegram_image_document,
     _acquire_telegram_instance_lock,
     _release_telegram_instance_lock,
 )
@@ -99,21 +107,30 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn("Bot token: configured", text)
         self.assertIn("Allowed user IDs: 2", text)
         self.assertIn("Auto process: enabled", text)
+        self.assertIn("Company profile: default", text)
         self.assertIn("Qwen OCR: disabled", text)
-        self.assertIn("Codex Scan fallback: disabled", text)
+        self.assertIn("OpenAI fallback: removed", text)
         self.assertIn("Polling startup: READY", text)
         self.assertIn("Photo ingestion: READY", text)
         self.assertIn("Status: READY", text)
+
+    def test_format_telegram_config_warns_when_company_profile_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            text = format_telegram_config(Settings(root=Path(temp), company_profile="missing-profile"))
+
+        self.assertIn("Company profile: missing-profile (missing)", text)
+        self.assertIn("Company profile warning:", text)
 
     def test_format_telegram_config_reports_enabled_qwen_scan(self):
         text = format_telegram_config(Settings(qwen_scan_enabled=True, qwen_api_key="key"))
 
         self.assertIn("Qwen OCR: enabled", text)
 
-    def test_format_telegram_config_reports_enabled_codex_scan(self):
+    def test_format_telegram_config_never_enables_openai_fallback(self):
         text = format_telegram_config(Settings(codex_scan_enabled=True, openai_api_key="key"))
 
-        self.assertIn("Codex Scan fallback: enabled", text)
+        self.assertIn("OpenAI fallback: removed", text)
+        self.assertNotIn("Codex Scan fallback: enabled", text)
 
     def test_telegram_start_message_reports_setup_mode_without_allowed_ids(self):
         self.assertIn("setup mode", telegram_start_message(Settings()))
@@ -147,6 +164,12 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn("/crops", text)
         self.assertIn("/change", text)
         self.assertIn("/del", text)
+        self.assertIn("/group", text)
+        self.assertIn("/rollback", text)
+        self.assertIn("Available type/category values", text)
+        self.assertIn("Food, Gas", text)
+        self.assertIn("Office supplies", text)
+        self.assertIn("/change 021 other", text)
         self.assertNotIn("/today_excel -", text)
         self.assertIn("/submit", text)
 
@@ -168,8 +191,10 @@ class TelegramBotTests(unittest.TestCase):
 
         self.assertIn("change", commands)
         self.assertIn("del", commands)
+        self.assertIn("group", commands)
+        self.assertIn("rollback", commands)
         self.assertIn("checked", commands)
-        self.assertIn("rerun", commands)
+        self.assertNotIn("rerun", commands)
         self.assertIn("submit", commands)
         self.assertIn("edit crop", commands["change"])
 
@@ -191,6 +216,25 @@ class TelegramBotTests(unittest.TestCase):
             finally:
                 _release_telegram_instance_lock(lock)
 
+    @unittest.skipIf(os.name != "nt", "Windows PID command-line check")
+    def test_telegram_instance_lock_ignores_reused_non_telegram_pid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = Settings(root=Path(temp), output_dir=Path(temp) / "out")
+            settings.output_dir.mkdir(parents=True)
+            process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+            try:
+                lock = settings.output_dir / "telegram_bot.pid"
+                lock.write_text(str(process.pid), encoding="utf-8")
+
+                acquired = _acquire_telegram_instance_lock(settings)
+                try:
+                    self.assertEqual(int(acquired.read_text(encoding="utf-8")), os.getpid())
+                finally:
+                    _release_telegram_instance_lock(acquired)
+            finally:
+                process.terminate()
+                process.wait(timeout=5)
+
     def test_empty_change_message_shows_mobile_template(self):
         text = change_message(Settings(), 123, [])
 
@@ -203,6 +247,85 @@ class TelegramBotTests(unittest.TestCase):
 
         self.assertIn("/del 021", text)
         self.assertIn("/del 021 022", text)
+
+    def test_group_message_arms_next_photo(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = Settings(root=Path(temp), output_dir=Path(temp) / "out")
+            output_dir = settings.output_dir / "telegram" / "123"
+            photo = Path(temp) / "photo.jpg"
+
+            text = group_message(settings, 123, [])
+
+            self.assertIn("Group mode is ready", text)
+            self.assertTrue(mark_source_for_group_if_armed(output_dir, photo))
+            self.assertFalse(mark_source_for_group_if_armed(output_dir, photo))
+
+    def test_group_message_previews_then_confirms_existing_crops(self):
+        with tempfile.TemporaryDirectory() as temp:
+            from PIL import Image
+
+            root = Path(temp)
+            settings = Settings(root=root, output_dir=root / "out")
+            output_dir = settings.output_dir / "telegram" / "123"
+            workbook = telegram_user_workbook(settings, 123)
+            crops = output_dir / "crops"
+            crops.mkdir(parents=True)
+            detail_crop = crops / "044_2026-05-09_MXN_566.00_SUSHI_ROLL.jpg"
+            card_crop = crops / "045_2026-05-09_MXN_622.60_SUSHI_ROLL_CARD.jpg"
+            Image.new("RGB", (120, 240), "white").save(detail_crop)
+            Image.new("RGB", (100, 220), "white").save(card_crop)
+            ReimbursementWorkbook(workbook).write_records(
+                [
+                    InvoiceRecord(line_no=44, invoice_date="2026-05-09", expense_category="Food", currency="MXN", total_amount=566, seller="SUSHI ROLL", crop_image=str(detail_crop)),
+                    InvoiceRecord(line_no=45, invoice_date="2026-05-09", expense_category="Food", currency="MXN", total_amount=622.60, tips=56.60, seller="SUSHI ROLL MIFEL", contents="venta con propina", crop_image=str(card_crop)),
+                ]
+            )
+
+            preview = group_message(settings, 123, ["044", "045"])
+
+            self.assertIn("Group preview", preview)
+            self.assertIn("Keep Trace ID: 044", preview)
+            wb = load_workbook(workbook, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                self.assertNotEqual(ws.cell(3, 2).value, "delete")
+            finally:
+                wb.close()
+
+            confirmed = group_message(settings, 123, ["confirm"])
+
+            self.assertIn("Group saved", confirmed)
+            self.assertIn("Mark delete: 045", confirmed)
+            records = load_workbook(workbook, data_only=True)
+            try:
+                ws = records[INVOICE_EXP_SHEET]
+                self.assertEqual(ws.cell(2, 2).value, "correct")
+                self.assertEqual(ws.cell(3, 2).value, "delete")
+            finally:
+                records.close()
+
+    def test_rollback_message_removes_last_pending_photo(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = Settings(
+                root=root,
+                inbound_dir=root / "data" / "inbound",
+                trial_dir=root / "data" / "trial",
+                output_dir=root / "data" / "output",
+                baseline_dir=root / "data" / "baseline",
+                telegram_allowed_user_ids=frozenset({123}),
+            )
+            photo = root / "data" / "inbound" / "telegram" / "123" / "2026-07-01" / "bad.jpg"
+            photo.parent.mkdir(parents=True)
+            photo.write_bytes(b"jpg")
+            save_queue_state(telegram_user_queue_path(settings, 123), QueueState([QueueItem(path=str(photo), status=PENDING)]))
+
+            text = rollback_message(settings, 123, "zh")
+
+            self.assertIn("已撤销最近一张照片", text)
+            self.assertNotIn("bad.jpg", text)
+            self.assertFalse(photo.exists())
+            self.assertEqual(load_queue_state(telegram_user_queue_path(settings, 123)).items, [])
 
     def test_processing_success_message(self):
         summary = PipelineSummary(
@@ -305,18 +428,157 @@ class TelegramBotTests(unittest.TestCase):
                 [InvoiceRecord(line_no=1, invoice_date="2026-06-20", expense_category="Food", seller="Cafe", total_amount=150, crop_image=str(crop))]
             )
 
-            text = change_message(settings, 123, ["021", "correct", "type", "Other", "+", "wrong", "OCR"])
+            text = change_message(settings, 123, ["021", "correct", "2026-7-1", "type", "Other", "+", "wrong", "OCR"])
 
             self.assertIn("Change saved", text)
             self.assertIn("Crop: 021", text)
             self.assertIn("Status: correct", text)
+            self.assertFalse((output / "报销_checked_2026.xlsx").exists())
+            self.assertFalse((output / "final_crops").exists())
+            wb = load_workbook(telegram_user_workbook(settings, 123), data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                headers = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                self.assertEqual(ws.cell(2, headers["Date"]).value.date(), date(2026, 7, 1))
+                self.assertEqual(ws.cell(2, headers["Accounting Category"]).value, "Other")
+                self.assertEqual(ws.cell(2, headers["Manual status"]).value, "correct")
+                self.assertIn("wrong OCR", ws.cell(2, headers["Detail"]).value)
+            finally:
+                wb.close()
+
+    def test_report_message_uses_current_checked_crops_not_historical_queue_done(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = Settings(
+                root=root,
+                inbound_dir=root / "data" / "inbound",
+                trial_dir=root / "data" / "trial",
+                output_dir=root / "data" / "output",
+                baseline_dir=root / "data" / "baseline",
+                telegram_allowed_user_ids=frozenset({123}),
+            )
+            output = settings.output_dir / "telegram" / "123"
+            review = output / "review_crops"
+            review.mkdir(parents=True)
+            crop1 = review / "001_2026-06-12_MXN_100.00_Cafe.jpg"
+            crop2 = review / "002_2026-06-13_MXN_200.00_Pemex.jpg"
+            crop1.write_bytes(b"jpg")
+            crop2.write_bytes(b"jpg")
+            ReimbursementWorkbook(telegram_user_workbook(settings, 123)).write_records(
+                [
+                    InvoiceRecord(line_no=1, invoice_date="2026-06-12", expense_category="Food", seller="Cafe", total_amount=100, crop_image=str(crop1)),
+                    InvoiceRecord(line_no=2, invoice_date="2026-06-13", expense_category="Gas", seller="Pemex", total_amount=200, crop_image=str(crop2)),
+                ]
+            )
+            items = [
+                QueueItem(path=str(root / f"{idx}.jpg"), status=DONE, received_at="2026-06-21T11:00:00", row_count=1)
+                for idx in range(48)
+            ]
+            save_queue_state(telegram_user_queue_path(settings, 123), QueueState(items))
+
+            text = report_message(settings, 123)
+
+            self.assertIn("Photos: 2", text)
+            self.assertNotIn("Photos: 48", text)
+            self.assertIn("Days: 2; Food average/day: 50.00 MXN", text)
+            self.assertFalse((output / "报销_checked_2026.xlsx").exists())
+            self.assertFalse((output / "final_crops").exists())
+
+    def test_change_message_accepts_wide_date_formats(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = Settings(
+                root=root,
+                inbound_dir=root / "data" / "inbound",
+                trial_dir=root / "data" / "trial",
+                output_dir=root / "data" / "output",
+                baseline_dir=root / "data" / "baseline",
+                telegram_allowed_user_ids=frozenset({123}),
+            )
+            output = settings.output_dir / "telegram" / "123"
+            review = output / "review_crops"
+            review.mkdir(parents=True)
+            crop = review / "022_2026-06-20_MXN_150.00_Cafe.jpg"
+            crop.write_bytes(b"jpg")
+            ReimbursementWorkbook(telegram_user_workbook(settings, 123)).write_records(
+                [InvoiceRecord(line_no=1, invoice_date="2026-06-20", expense_category="Food", seller="Cafe", total_amount=150, crop_image=str(crop))]
+            )
+
+            text = change_message(settings, 123, ["022", "date", "July", "1", "2026"])
+
+            self.assertIn("Change saved", text)
+            wb = load_workbook(telegram_user_workbook(settings, 123), data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                headers = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                self.assertEqual(ws.cell(2, headers["Date"]).value.date(), date(2026, 7, 1))
+                self.assertEqual(ws.cell(2, headers["Manual status"]).value, "ok")
+            finally:
+                wb.close()
+
+    def test_change_message_accepts_category_shorthand(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = Settings(
+                root=root,
+                inbound_dir=root / "data" / "inbound",
+                trial_dir=root / "data" / "trial",
+                output_dir=root / "data" / "output",
+                baseline_dir=root / "data" / "baseline",
+                telegram_allowed_user_ids=frozenset({123}),
+            )
+            output = settings.output_dir / "telegram" / "123"
+            review = output / "review_crops"
+            review.mkdir(parents=True)
+            crop = review / "023_2026-06-20_MXN_150.00_Cafe.jpg"
+            crop.write_bytes(b"jpg")
+            ReimbursementWorkbook(telegram_user_workbook(settings, 123)).write_records(
+                [InvoiceRecord(line_no=1, invoice_date="2026-06-20", expense_category="Food", seller="Cafe", total_amount=150, crop_image=str(crop))]
+            )
+
+            text = change_message(settings, 123, ["023", "other"])
+
+            self.assertIn("Change saved", text)
+            self.assertTrue(load_queue_state(telegram_user_queue_path(settings, 123)).rollback_blocked)
             wb = load_workbook(telegram_user_workbook(settings, 123), data_only=True)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
                 headers = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
                 self.assertEqual(ws.cell(2, headers["Accounting Category"]).value, "Other")
-                self.assertEqual(ws.cell(2, headers["Manual status"]).value, "correct")
-                self.assertIn("wrong OCR", ws.cell(2, headers["Detail"]).value)
+                self.assertEqual(ws.cell(2, headers["Manual status"]).value, "ok")
+            finally:
+                wb.close()
+
+    def test_change_message_accepts_chinese_category_shorthand(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = Settings(
+                root=root,
+                inbound_dir=root / "data" / "inbound",
+                trial_dir=root / "data" / "trial",
+                output_dir=root / "data" / "output",
+                baseline_dir=root / "data" / "baseline",
+                telegram_allowed_user_ids=frozenset({123}),
+            )
+            output = settings.output_dir / "telegram" / "123"
+            review = output / "review_crops"
+            review.mkdir(parents=True)
+            crop = review / "024_2026-06-20_MXN_150.00_Cafe.jpg"
+            crop.write_bytes(b"jpg")
+            ReimbursementWorkbook(telegram_user_workbook(settings, 123)).write_records(
+                [InvoiceRecord(line_no=1, invoice_date="2026-06-20", expense_category="Food", seller="Cafe", total_amount=150, crop_image=str(crop))]
+            )
+
+            text = change_message(settings, 123, ["024", "\u6c7d\u6cb9"])
+
+            self.assertIn("Change saved", text)
+            wb = load_workbook(telegram_user_workbook(settings, 123), data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                headers = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                self.assertEqual(ws.cell(2, headers["Accounting Category"]).value, "Gas")
+                self.assertEqual(ws.cell(2, headers["Type"]).value, "\u6c7d\u6cb9")
+                self.assertEqual(ws.cell(2, headers["Manual status"]).value, "ok")
             finally:
                 wb.close()
 
@@ -345,6 +607,8 @@ class TelegramBotTests(unittest.TestCase):
 
             self.assertIn("Use /del 021", rejected)
             self.assertIn("Deleted", deleted)
+            self.assertFalse((output / "报销_checked_2026.xlsx").exists())
+            self.assertFalse((output / "final_crops").exists())
             wb = load_workbook(telegram_user_workbook(settings, 123), data_only=True)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
@@ -383,6 +647,8 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn("Deleted", text)
             self.assertIn("Crops: 038, 039", text)
             self.assertIn("Count: 2", text)
+            self.assertFalse((output / "报销_checked_2026.xlsx").exists())
+            self.assertFalse((output / "final_crops").exists())
             wb = load_workbook(telegram_user_workbook(settings, 123), data_only=True)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
@@ -391,23 +657,6 @@ class TelegramBotTests(unittest.TestCase):
                 self.assertEqual(ws.cell(3, headers["Manual status"]).value, "delete")
             finally:
                 wb.close()
-
-    def test_rerun_message_reports_missing_checked_baseline(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            settings = Settings(
-                root=root,
-                inbound_dir=root / "data" / "inbound",
-                trial_dir=root / "data" / "trial",
-                output_dir=root / "data" / "output",
-                baseline_dir=root / "data" / "baseline",
-                telegram_allowed_user_ids=frozenset({123}),
-            )
-
-            text = rerun_message(settings, 123)
-
-            self.assertIn("Cannot rerun", text)
-            self.assertIn("/report", text)
 
     def test_telegram_photo_filename_uses_timestamp_and_file_id(self):
         stamp = datetime(2026, 6, 12, 8, 9, 10)
@@ -423,6 +672,18 @@ class TelegramBotTests(unittest.TestCase):
         stamp = datetime(2026, 6, 12, 8, 9, 10)
 
         self.assertEqual(telegram_photo_filename(stamp, "???", "unique-id"), "080910_unique-id.jpg")
+
+    def test_telegram_image_document_filename_preserves_supported_extension(self):
+        stamp = datetime(2026, 6, 12, 8, 9, 10)
+
+        self.assertEqual(telegram_image_document_filename(stamp, "file/id", "receipt.PNG"), "080910_file_id.png")
+
+    def test_telegram_image_document_filter_accepts_images_only(self):
+        image_document = type("Document", (), {"mime_type": "image/jpeg", "file_name": "receipt.jpg"})()
+        pdf_document = type("Document", (), {"mime_type": "application/pdf", "file_name": "receipt.pdf"})()
+
+        self.assertTrue(is_supported_telegram_image_document(image_document))
+        self.assertFalse(is_supported_telegram_image_document(pdf_document))
 
     def test_review_crop_paths_returns_review_images(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -614,7 +875,7 @@ class TelegramBotTests(unittest.TestCase):
             wb = load_workbook(telegram_user_workbook(settings, 123))
             try:
                 ws = wb[INVOICE_EXP_SHEET]
-                ws.cell(4, 12).value = "delete"
+                ws.cell(4, 2).value = "delete"
                 wb.save(telegram_user_workbook(settings, 123))
             finally:
                 wb.close()

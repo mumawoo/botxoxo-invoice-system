@@ -1,0 +1,9 @@
+{
+  "name": "default",
+  "category_overrides": [
+    {"match": "walmart", "category": "Food"},
+    {"match": "cordia", "category": "Food"},
+    {"match": "cordial", "category": "Food"},
+    {"match": "codie", "category": "Food"}
+  ]
+}

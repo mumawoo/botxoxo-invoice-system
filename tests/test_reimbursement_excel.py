@@ -10,20 +10,30 @@ from invoice_system.fx_rates import ExchangeRate
 from invoice_system.models import InvoiceRecord
 from invoice_system.reimbursement_excel import (
     CHECKED_WORKBOOK_NAME,
+    FINAL_CROPS_MANIFEST,
     FOOD_EXP_SHEET,
     INVOICE_EXP_SHEET,
     OTHER_EXP_SHEET,
     REIMBURSEMENT_WORKBOOK_NAME,
+    SUMMARY_SHEET,
     ReimbursementWorkbook,
     assign_available_line_numbers,
+    apply_reimbursement_group,
     build_checked_outputs,
     change_reimbursement_record,
     clear_generated_crops,
     corrected_crop_names,
     focus_reimbursement_workbook,
     load_reimbursement_records,
+    preview_reimbursement_group,
     rerun_checked_from_finance_edits,
 )
+
+
+def _date_text(value):
+    if hasattr(value, "date"):
+        value = value.date()
+    return value.isoformat() if hasattr(value, "isoformat") else str(value)
 
 
 class ReimbursementExcelTests(unittest.TestCase):
@@ -51,6 +61,10 @@ class ReimbursementExcelTests(unittest.TestCase):
             wb = load_workbook(path, data_only=True)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
+                self.assertEqual(ws.cell(1, 2).value, "Manual status")
+                self.assertEqual(ws.cell(1, 12).value, "Trace ID")
+                self.assertEqual(ws.cell(1, 13).value, "System note")
+                self.assertEqual(ws.cell(1, 14).value, "Invoice link")
                 self.assertEqual(ws.cell(2, 4).value, 175)
                 self.assertEqual(ws.cell(2, 5).value, "餐饮")
                 self.assertEqual(ws.cell(2, 6).value, "USD")
@@ -171,7 +185,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             wb = load_workbook(path)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
-                ws.cell(2, 12).value = "corrected"
+                ws.cell(2, 2).value = "corrected"
                 wb.save(path)
             finally:
                 wb.close()
@@ -214,7 +228,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             wb = load_workbook(path)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
-                ws.cell(2, 6).value = "ok"
+                ws.cell(2, 2).value = "ok"
                 wb.save(path)
             finally:
                 wb.close()
@@ -242,7 +256,34 @@ class ReimbursementExcelTests(unittest.TestCase):
                 ]
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0][0], 4)
-                self.assertEqual(rows[0][5], "ok")
+                self.assertEqual(rows[0][1], "ok")
+            finally:
+                wb.close()
+
+    def test_marker_outside_manual_status_does_not_lock_row(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / REIMBURSEMENT_WORKBOOK_NAME
+            store = ReimbursementWorkbook(path)
+            store.write_records(
+                [InvoiceRecord(line_no=1, invoice_date="2026-06-12", expense_category="Food", total_amount=100, seller="Cafe")]
+            )
+            wb = load_workbook(path)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                ws.cell(2, 10).value = "ok"
+                wb.save(path)
+            finally:
+                wb.close()
+
+            replacement = InvoiceRecord(line_no=2, invoice_date="2026-06-13", expense_category="Gas", total_amount=50, seller="Pemex")
+            store.write_records([replacement])
+
+            wb = load_workbook(path, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                self.assertEqual(ws.cell(2, 1).value, 2)
+                self.assertEqual(ws.cell(2, 9).value, "Pemex")
+                self.assertIsNone(ws.cell(2, 2).value)
             finally:
                 wb.close()
 
@@ -254,7 +295,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             wb = load_workbook(path)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
-                ws.cell(2, 12).value = "deleted"
+                ws.cell(2, 2).value = "deleted"
                 wb.save(path)
             finally:
                 wb.close()
@@ -272,9 +313,9 @@ class ReimbursementExcelTests(unittest.TestCase):
                     if any(ws.cell(row, col).value not in (None, "") for col in range(1, 13))
                 ]
                 self.assertEqual(len(rows), 2)
-                self.assertEqual(rows[0][11], "deleted")
+                self.assertEqual(rows[0][1], "deleted")
                 self.assertEqual(rows[1][8], "Cafe")
-                self.assertIsNone(rows[1][11])
+                self.assertIsNone(rows[1][1])
             finally:
                 wb.close()
 
@@ -290,8 +331,8 @@ class ReimbursementExcelTests(unittest.TestCase):
             wb = load_workbook(path)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
-                ws.cell(2, 12).value = "ok"
-                ws.cell(3, 12).value = "ok deleted"
+                ws.cell(2, 2).value = "ok"
+                ws.cell(3, 2).value = "ok deleted"
                 wb.save(path)
             finally:
                 wb.close()
@@ -322,7 +363,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             wb = load_workbook(path)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
-                ws.cell(3, 12).value = "deleted"
+                ws.cell(3, 2).value = "deleted"
                 wb.save(path)
             finally:
                 wb.close()
@@ -335,38 +376,192 @@ class ReimbursementExcelTests(unittest.TestCase):
             final_crops = sorted((root / "final_crops").rglob("*.jpg"))
             self.assertEqual(
                 [path.relative_to(root / "final_crops").as_posix() for path in final_crops],
-                ["food/001_2026-06-12_MXN_100.00_Cafe.jpg", "other/002_2026-06-14_MXN_50.00_Store.jpg"],
+                ["food/001_trace001_2026-06-12_MXN_100.00_Cafe.jpg", "other/002_trace003_2026-06-14_MXN_50.00_Store.jpg"],
             )
             checked = load_workbook(root / CHECKED_WORKBOOK_NAME, data_only=True)
             try:
                 self.assertIn(FOOD_EXP_SHEET, checked.sheetnames)
                 self.assertIn(OTHER_EXP_SHEET, checked.sheetnames)
-                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, 8).value, "Cafe")
-                self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, 8).value, "Store")
-                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, 11).value, "final_crops/food/001_2026-06-12_MXN_100.00_Cafe.jpg")
-                self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, 11).value, "final_crops/other/002_2026-06-14_MXN_50.00_Store.jpg")
+                food_headers = {checked[FOOD_EXP_SHEET].cell(1, col).value: col for col in range(1, checked[FOOD_EXP_SHEET].max_column + 1)}
+                other_headers = {checked[OTHER_EXP_SHEET].cell(1, col).value: col for col in range(1, checked[OTHER_EXP_SHEET].max_column + 1)}
+                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, food_headers["Merchant"]).value, "Cafe")
+                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, food_headers["Trace ID"]).value, "001")
+                self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, other_headers["Merchant"]).value, "Store")
+                self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, other_headers["Trace ID"]).value, "003")
+                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, food_headers["Invoice link"]).value, "final_crops/food/001_trace001_2026-06-12_MXN_100.00_Cafe.jpg")
+                self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, other_headers["Invoice link"]).value, "final_crops/other/002_trace003_2026-06-14_MXN_50.00_Store.jpg")
                 ws = checked[INVOICE_EXP_SHEET]
+                headers = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
                 self.assertEqual(ws.max_row, 3)
                 self.assertEqual(ws.cell(1, 2).value, "Date")
-                self.assertEqual(ws.cell(1, 11).value, "Invoice link")
+                self.assertEqual(ws.cell(1, headers["Invoice link"]).value, "Invoice link")
                 self.assertEqual(ws.cell(2, 1).value, 1)
                 self.assertEqual(ws.cell(3, 1).value, 2)
-                self.assertEqual(ws.cell(3, 8).value, "Store")
-                self.assertEqual(ws.cell(3, 11).value, "final_crops/other/002_2026-06-14_MXN_50.00_Store.jpg")
-                self.assertEqual(ws.cell(3, 11).hyperlink.target, "final_crops/other/002_2026-06-14_MXN_50.00_Store.jpg")
+                self.assertEqual(ws.cell(3, headers["Merchant"]).value, "Store")
+                self.assertEqual(ws.cell(3, headers["Trace ID"]).value, "003")
+                self.assertEqual(ws.cell(3, headers["Invoice link"]).value, "final_crops/other/002_trace003_2026-06-14_MXN_50.00_Store.jpg")
+                self.assertEqual(ws.cell(3, headers["Invoice link"]).hyperlink.target, "final_crops/other/002_trace003_2026-06-14_MXN_50.00_Store.jpg")
             finally:
                 checked.close()
 
-    def test_build_checked_outputs_keeps_combined_supporting_crops_as_ab_files(self):
+    def test_checked_summary_lists_each_day_and_only_counts_food(self):
         with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / REIMBURSEMENT_WORKBOOK_NAME
+            crops = root / "crops"
+            crops.mkdir()
+            crop1 = crops / "001_2026-07-01_MXN_100.00_Cafe.jpg"
+            crop2 = crops / "002_2026-07-02_MXN_999.00_Deleted_Food.jpg"
+            crop3 = crops / "003_2026-07-03_MXN_200.00_Restaurant.jpg"
+            crop4 = crops / "004_2026-07-04_MXN_88.00_Store.jpg"
+            for crop in (crop1, crop2, crop3, crop4):
+                crop.write_bytes(b"jpg")
+            ReimbursementWorkbook(path).write_records(
+                [
+                    InvoiceRecord(line_no=1, invoice_date="2026-07-01", expense_category="Food", total_amount=100, seller="Cafe", crop_image=str(crop1)),
+                    InvoiceRecord(line_no=2, invoice_date="2026-07-02", expense_category="Food", total_amount=999, seller="Deleted Food", crop_image=str(crop2)),
+                    InvoiceRecord(line_no=3, invoice_date="2026-07-03", expense_category="Food", total_amount=200, seller="Restaurant", crop_image=str(crop3)),
+                    InvoiceRecord(line_no=4, invoice_date="2026-07-04", expense_category="Other", total_amount=88, seller="Store", crop_image=str(crop4)),
+                ]
+            )
+            wb = load_workbook(path)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                ws.cell(3, 2).value = "deleted"
+                wb.save(path)
+            finally:
+                wb.close()
+
+            build_checked_outputs(root)
+
+            checked = load_workbook(root / CHECKED_WORKBOOK_NAME, data_only=True)
+            try:
+                self.assertEqual(checked.sheetnames[0], SUMMARY_SHEET)
+                ws = checked[SUMMARY_SHEET]
+                self.assertEqual(ws["B3"].value, "2026-07-01 \u81f3 2026-07-04")
+                self.assertEqual(ws["B4"].value, "4 \u5929")
+                self.assertEqual(ws["B5"].value, "300.00 MXN")
+                self.assertEqual(ws["B6"].value, "75.00 MXN")
+                self.assertEqual(ws["B7"].value, "2 \u5929")
+                self.assertEqual(ws["B8"].value, "2026-07-02, 2026-07-04")
+                daily = [
+                    (_date_text(ws.cell(row, 1).value), ws.cell(row, 2).value, ws.cell(row, 3).value)
+                    for row in range(12, 16)
+                ]
+                self.assertEqual(
+                    daily,
+                    [
+                        ("2026-07-01", 100, "Yes"),
+                        ("2026-07-02", 0, "No"),
+                        ("2026-07-03", 200, "Yes"),
+                        ("2026-07-04", 0, "No"),
+                    ],
+                )
+            finally:
+                checked.close()
+
+    def test_build_checked_outputs_reuses_unchanged_final_crops(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / REIMBURSEMENT_WORKBOOK_NAME
+            review = root / "review_crops"
+            review.mkdir()
+            crop1 = review / "001_2026-06-12_MXN_100.00_Cafe.jpg"
+            crop2 = review / "002_2026-06-13_MXN_50.00_Store.jpg"
+            crop3 = review / "003_2026-06-14_MXN_25.00_Kiosk.jpg"
+            crop1.write_bytes(b"one")
+            crop2.write_bytes(b"two")
+            crop3.write_bytes(b"three")
+            records = [
+                InvoiceRecord(line_no=1, invoice_date="2026-06-12", expense_category="Food", total_amount=100, seller="Cafe", crop_image=str(crop1)),
+                InvoiceRecord(line_no=2, invoice_date="2026-06-13", expense_category="Other", total_amount=50, seller="Store", crop_image=str(crop2)),
+            ]
+            store = ReimbursementWorkbook(path)
+            store.write_records(records)
+            build_checked_outputs(root)
+            first_final = root / "final_crops" / "food" / "001_trace001_2026-06-12_MXN_100.00_Cafe.jpg"
+            first_final.write_bytes(b"sentinel")
+
+            store.write_records(
+                [
+                    *records,
+                    InvoiceRecord(line_no=3, invoice_date="2026-06-14", expense_category="Other", total_amount=25, seller="Kiosk", crop_image=str(crop3)),
+                ]
+            )
+            result = build_checked_outputs(root)
+
+            self.assertEqual(result.crops_written, 3)
+            self.assertEqual(first_final.read_bytes(), b"sentinel")
+            self.assertTrue((root / "final_crops" / "other" / "003_trace003_2026-06-14_MXN_25.00_Kiosk.jpg").exists())
+            self.assertTrue((root / FINAL_CROPS_MANIFEST).exists())
+
+    def test_build_checked_outputs_prunes_deleted_final_crop_from_manifest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / REIMBURSEMENT_WORKBOOK_NAME
+            review = root / "review_crops"
+            review.mkdir()
+            crop1 = review / "001_2026-06-12_MXN_100.00_Cafe.jpg"
+            crop2 = review / "002_2026-06-13_MXN_50.00_Store.jpg"
+            crop1.write_bytes(b"one")
+            crop2.write_bytes(b"two")
+            ReimbursementWorkbook(path).write_records(
+                [
+                    InvoiceRecord(line_no=1, invoice_date="2026-06-12", expense_category="Food", total_amount=100, seller="Cafe", crop_image=str(crop1)),
+                    InvoiceRecord(line_no=2, invoice_date="2026-06-13", expense_category="Other", total_amount=50, seller="Store", crop_image=str(crop2)),
+                ]
+            )
+            build_checked_outputs(root)
+            deleted_final = root / "final_crops" / "food" / "001_trace001_2026-06-12_MXN_100.00_Cafe.jpg"
+            self.assertTrue(deleted_final.exists())
+            wb = load_workbook(path)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                ws.cell(2, 2).value = "delete"
+                wb.save(path)
+            finally:
+                wb.close()
+
+            build_checked_outputs(root)
+
+            self.assertFalse(deleted_final.exists())
+            manifest = json.loads((root / FINAL_CROPS_MANIFEST).read_text(encoding="utf-8"))
+            self.assertNotIn("001", manifest["records"])
+            self.assertIn("002", manifest["records"])
+
+    def test_build_checked_outputs_force_rebuild_removes_stale_final_crop(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / REIMBURSEMENT_WORKBOOK_NAME
+            review = root / "review_crops"
+            review.mkdir()
+            crop = review / "001_2026-06-12_MXN_100.00_Cafe.jpg"
+            crop.write_bytes(b"one")
+            stale = root / "final_crops" / "other" / "999_old.jpg"
+            stale.parent.mkdir(parents=True)
+            stale.write_bytes(b"stale")
+            ReimbursementWorkbook(path).write_records(
+                [InvoiceRecord(line_no=1, invoice_date="2026-06-12", expense_category="Food", total_amount=100, seller="Cafe", crop_image=str(crop))]
+            )
+
+            result = build_checked_outputs(root, force=True)
+
+            self.assertEqual(result.crops_written, 1)
+            self.assertFalse(stale.exists())
+            self.assertTrue((root / "final_crops" / "food" / "001_trace001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
+
+    def test_build_checked_outputs_combines_supporting_crops_into_one_final_image(self):
+        with tempfile.TemporaryDirectory() as temp:
+            from PIL import Image
+
             root = Path(temp)
             path = root / REIMBURSEMENT_WORKBOOK_NAME
             review = root / "review_crops"
             review.mkdir()
             primary = review / "040_2026-06-12_MXN_126.00_Cafe.jpg"
             supporting = review / "041_2026-06-12_MXN_126.00_Cafe_card.jpg"
-            primary.write_bytes(b"invoice")
-            supporting.write_bytes(b"payment")
+            Image.new("RGB", (120, 240), "white").save(primary)
+            Image.new("RGB", (100, 200), "white").save(supporting)
             ReimbursementWorkbook(path).write_records(
                 [
                     InvoiceRecord(
@@ -384,22 +579,95 @@ class ReimbursementExcelTests(unittest.TestCase):
             result = build_checked_outputs(root)
 
             self.assertEqual(result.records_written, 1)
-            self.assertEqual(result.crops_written, 2)
+            self.assertEqual(result.crops_written, 1)
             final_crops = sorted((root / "final_crops").rglob("*.jpg"))
             self.assertEqual(
                 [path.relative_to(root / "final_crops").as_posix() for path in final_crops],
-                [
-                    "food/001a_2026-06-12_MXN_126.00_Cafe.jpg",
-                    "food/001b_2026-06-12_MXN_126.00_Cafe.jpg",
-                ],
+                ["food/001_trace040_2026-06-12_MXN_126.00_Cafe.jpg"],
             )
+            with Image.open(final_crops[0]) as combined:
+                self.assertGreater(combined.width, 120)
+                self.assertGreaterEqual(combined.height, 240)
             checked = load_workbook(root / CHECKED_WORKBOOK_NAME, data_only=True)
             try:
                 ws = checked[INVOICE_EXP_SHEET]
+                headers = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
                 self.assertEqual(ws.max_row, 2)
-                self.assertEqual(ws.cell(2, 11).value, "final_crops/food/001a_2026-06-12_MXN_126.00_Cafe.jpg")
+                self.assertEqual(ws.cell(2, headers["Trace ID"]).value, "040")
+                self.assertEqual(ws.cell(2, headers["Invoice link"]).value, "final_crops/food/001_trace040_2026-06-12_MXN_126.00_Cafe.jpg")
             finally:
                 checked.close()
+
+    def test_preview_and_apply_reimbursement_group_merges_rows_and_archives_original_crops(self):
+        with tempfile.TemporaryDirectory() as temp:
+            from PIL import Image
+
+            root = Path(temp)
+            path = root / REIMBURSEMENT_WORKBOOK_NAME
+            crops = root / "crops"
+            crops.mkdir()
+            detail_crop = crops / "044_2026-05-09_MXN_566.00_SUSHI_ROLL.jpg"
+            card_crop = crops / "045_2026-05-09_MXN_622.60_SUSHI_ROLL_CARD.jpg"
+            Image.new("RGB", (120, 240), "white").save(detail_crop)
+            Image.new("RGB", (100, 220), "white").save(card_crop)
+            ReimbursementWorkbook(path).write_records(
+                [
+                    InvoiceRecord(
+                        line_no=44,
+                        invoice_date="2026-05-09",
+                        expense_category="Food",
+                        currency="MXN",
+                        total_amount=566,
+                        seller="SUSHI ROLL",
+                        crop_image=str(detail_crop),
+                    ),
+                    InvoiceRecord(
+                        line_no=45,
+                        invoice_date="2026-05-09",
+                        expense_category="Food",
+                        currency="MXN",
+                        total_amount=622.60,
+                        tips=56.60,
+                        seller="SUSHI ROLL MIFEL",
+                        contents="venta con propina",
+                        crop_image=str(card_crop),
+                    ),
+                ]
+            )
+
+            preview = preview_reimbursement_group(root, ["044", "045"])
+
+            self.assertEqual(preview.primary_id, "044")
+            self.assertEqual(preview.total_amount, 622.60)
+            self.assertEqual(preview.tips, 56.60)
+            self.assertTrue(detail_crop.exists())
+            self.assertTrue(card_crop.exists())
+
+            result = apply_reimbursement_group(root, ["044", "045"])
+
+            self.assertEqual(result.primary_id, "044")
+            self.assertEqual(result.deleted_ids, ("045",))
+            self.assertTrue(result.crop_path.exists())
+            self.assertTrue((root / "group_archive" / "044_045" / detail_crop.name).exists())
+            self.assertTrue((root / "group_archive" / "044_045" / card_crop.name).exists())
+            self.assertFalse(detail_crop.exists())
+            self.assertFalse(card_crop.exists())
+            records = load_reimbursement_records(path)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0].line_no, 44)
+            self.assertEqual(records[0].total_amount, 622.60)
+            self.assertEqual(result.tips, 56.60)
+            self.assertEqual(Path(records[0].crop_image).name, result.crop_path.name)
+
+            wb = load_workbook(path, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                headers = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                self.assertEqual(ws.cell(2, headers["Manual status"]).value, "correct")
+                self.assertEqual(ws.cell(3, headers["Manual status"]).value, "delete")
+                self.assertEqual(ws.cell(3, headers["System note"]).value, "Grouped into 044")
+            finally:
+                wb.close()
 
     def test_change_reimbursement_record_updates_category_and_locks_by_crop_id(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -413,7 +681,7 @@ class ReimbursementExcelTests(unittest.TestCase):
                 [InvoiceRecord(line_no=1, invoice_date="2026-06-12", expense_category="Food", total_amount=100, seller="Cafe", crop_image=str(crop))]
             )
 
-            result = change_reimbursement_record(root, "021", category="Other")
+            result = change_reimbursement_record(root, "021", invoice_date="2026-07-01", category="Other")
 
             self.assertEqual(result.crop_id, "021")
             self.assertEqual(result.status, "ok")
@@ -421,8 +689,53 @@ class ReimbursementExcelTests(unittest.TestCase):
             try:
                 ws = wb[INVOICE_EXP_SHEET]
                 columns = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                self.assertEqual(ws.cell(2, columns["Date"]).value.date(), date(2026, 7, 1))
                 self.assertEqual(ws.cell(2, columns["Accounting Category"]).value, "Other")
                 self.assertEqual(ws.cell(2, columns["Manual status"]).value, "ok")
+            finally:
+                wb.close()
+
+    def test_manual_no_syncs_to_crop_id_and_change_uses_crop_id(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / REIMBURSEMENT_WORKBOOK_NAME
+            review = root / "review_crops"
+            review.mkdir()
+            old_crop = review / "001_2026-06-10_MXN_10.00_Old.jpg"
+            crop_001 = review / "001_2026-06-12_MXN_100.00_Cafe.jpg"
+            crop_002 = review / "002_2026-06-13_MXN_50.00_Gas.jpg"
+            old_crop.write_bytes(b"old")
+            crop_001.write_bytes(b"one")
+            crop_002.write_bytes(b"two")
+            ReimbursementWorkbook(path).write_records(
+                [
+                    InvoiceRecord(line_no=1, invoice_date="2026-06-10", expense_category="Food", total_amount=10, seller="Old", crop_image=str(old_crop)),
+                    InvoiceRecord(line_no=2, invoice_date="2026-06-12", expense_category="Food", total_amount=100, seller="Cafe", crop_image=str(crop_001)),
+                    InvoiceRecord(line_no=3, invoice_date="2026-06-13", expense_category="Gas", total_amount=50, seller="Gas", crop_image=str(crop_002)),
+                ]
+            )
+            wb = load_workbook(path)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                columns = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                ws.cell(2, columns["Manual status"]).value = "delete"
+                ws.cell(3, columns["No."]).value = 2
+                ws.cell(4, columns["No."]).value = 3
+                wb.save(path)
+            finally:
+                wb.close()
+
+            change_reimbursement_record(root, "002", category="Other")
+
+            wb = load_workbook(path, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                columns = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                self.assertEqual(ws.cell(3, columns["No."]).value, 1)
+                self.assertEqual(ws.cell(4, columns["No."]).value, 2)
+                self.assertEqual(ws.cell(3, columns["Accounting Category"]).value, "Food")
+                self.assertEqual(ws.cell(4, columns["Accounting Category"]).value, "Other")
+                self.assertEqual(ws.cell(4, columns["Manual status"]).value, "ok")
             finally:
                 wb.close()
 
@@ -488,16 +801,17 @@ class ReimbursementExcelTests(unittest.TestCase):
             wb = load_workbook(path, data_only=True)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
+                columns = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
                 rows = [
-                    (ws.cell(row, 2).value, ws.cell(row, 12).value)
+                    (ws.cell(row, columns["Invoice link"]).value, ws.cell(row, columns["Manual status"]).value)
                     for row in range(2, ws.max_row + 1)
-                    if ws.cell(row, 2).value
+                    if ws.cell(row, columns["Invoice link"]).value
                 ]
                 self.assertEqual(rows, [("review_crops/038_2026-06-12_USD_11.00_Store.jpg", "delete"), ("review_crops/041_2026-06-12_USD_11.00_Store.jpg", None)])
             finally:
                 wb.close()
 
-    def test_build_checked_outputs_migrates_legacy_final_crops_to_review(self):
+    def test_build_checked_outputs_reads_legacy_final_crops_without_review_copy(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             path = root / REIMBURSEMENT_WORKBOOK_NAME
@@ -523,12 +837,15 @@ class ReimbursementExcelTests(unittest.TestCase):
             result = build_checked_outputs(root)
 
             self.assertEqual(result.records_written, 1)
-            self.assertTrue((root / "review_crops" / legacy_final.name).exists())
-            self.assertTrue((root / "review_crops" / legacy_nested.name).exists())
-            self.assertTrue((root / "final_crops" / "food" / legacy_final.name).exists())
+            self.assertFalse((root / "review_crops" / legacy_final.name).exists())
+            self.assertFalse((root / "review_crops" / legacy_nested.name).exists())
+            self.assertTrue((root / "final_crops" / "food" / "001_trace001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
             wb = load_workbook(path, data_only=True)
             try:
-                self.assertEqual(wb[INVOICE_EXP_SHEET].cell(2, 2).value, f"review_crops/{legacy_final.name}")
+                ws = wb[INVOICE_EXP_SHEET]
+                columns = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                self.assertEqual(ws.cell(2, columns["Trace ID"]).value, "001")
+                self.assertEqual(ws.cell(2, columns["Invoice link"]).value, f"final_crops/{legacy_final.name}")
             finally:
                 wb.close()
 
@@ -583,9 +900,9 @@ class ReimbursementExcelTests(unittest.TestCase):
                 ws = wb[INVOICE_EXP_SHEET]
                 columns = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
                 link = ws.cell(2, columns["Invoice link"]).hyperlink.target
-                self.assertEqual(link, "review_crops/021_2025-12-03_USD_38.33_ALICIA.jpg")
+                self.assertEqual(link, "crops/021_2025-12-03_USD_38.33_ALICIA.jpg")
                 self.assertEqual(ws.cell(1, columns["Manual status"]).value, "Manual status")
-                self.assertTrue((root / "review_crops" / raw_crop.name).exists())
+                self.assertFalse((root / "review_crops" / raw_crop.name).exists())
             finally:
                 wb.close()
 
@@ -616,17 +933,18 @@ class ReimbursementExcelTests(unittest.TestCase):
             try:
                 ws = wb[INVOICE_EXP_SHEET]
                 self.assertEqual(ws.cell(2, 11).value, "Other")
-                self.assertEqual(ws.cell(2, 12).value, "correct")
+                self.assertEqual(ws.cell(2, 2).value, "correct")
             finally:
                 wb.close()
             checked = load_workbook(root / CHECKED_WORKBOOK_NAME, data_only=True)
             try:
+                other_headers = {checked[OTHER_EXP_SHEET].cell(1, col).value: col for col in range(1, checked[OTHER_EXP_SHEET].max_column + 1)}
                 self.assertEqual(checked[FOOD_EXP_SHEET].max_row, 1)
                 self.assertEqual(checked[OTHER_EXP_SHEET].cell(3, 1).value, 2)
-                self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, 11).value, "final_crops/other/001_2026-06-12_MXN_100.00_Cafe.jpg")
+                self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, other_headers["Invoice link"]).value, "final_crops/other/001_trace001_2026-06-12_MXN_100.00_Cafe.jpg")
             finally:
                 checked.close()
-            self.assertTrue((root / "final_crops" / "other" / "001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
+            self.assertTrue((root / "final_crops" / "other" / "001_trace001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
 
             _move_checked_row(root / CHECKED_WORKBOOK_NAME, OTHER_EXP_SHEET, FOOD_EXP_SHEET, 2)
             second = rerun_checked_from_finance_edits(root)
@@ -635,7 +953,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             checked = load_workbook(root / CHECKED_WORKBOOK_NAME, data_only=True)
             try:
                 self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, 1).value, 1)
-                self.assertTrue((root / "final_crops" / "food" / "001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
+                self.assertTrue((root / "final_crops" / "food" / "001_trace001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
             finally:
                 checked.close()
 
@@ -650,7 +968,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             wb = load_workbook(path)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
-                ws.cell(2, 12).value = "corrected"
+                ws.cell(2, 2).value = "corrected"
                 ws.cell(2, 9).value = "Manual Cafe"
                 wb.save(path)
             finally:
@@ -697,7 +1015,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             wb = load_workbook(path)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
-                ws.cell(2, 12).value = "corrected"
+                ws.cell(2, 2).value = "corrected"
                 wb.save(path)
             finally:
                 wb.close()

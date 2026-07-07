@@ -84,6 +84,7 @@ class Settings:
     telegram_allowed_user_ids: frozenset[int] = frozenset()
     telegram_auto_process: bool = False
     telegram_language: str = "en"
+    company_profile: str = "default"
     ai_visual_count_enabled: bool = False
     ai_visual_count_min_opencv_crops: int = 4
     pairing_mode: str = "auto"
@@ -106,9 +107,9 @@ class Settings:
             trial_dir=base / "data" / "trial",
             output_dir=base / "data" / "output",
             baseline_dir=base / "data" / "baseline",
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1"),
-            codex_scan_enabled=parse_bool(os.getenv("ENABLE_CODEX_SCAN"), False),
+            openai_api_key=None,
+            openai_model="",
+            codex_scan_enabled=False,
             qwen_api_key=os.getenv("QWEN_API_KEY") or os.getenv("DASHSCOPE_API_KEY"),
             qwen_model=os.getenv("QWEN_MODEL", "qwen-vl-max"),
             qwen_base_url=os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"),
@@ -117,7 +118,8 @@ class Settings:
             telegram_allowed_user_ids=frozenset(allowed),
             telegram_auto_process=parse_bool(os.getenv("TELEGRAM_AUTO_PROCESS"), False),
             telegram_language=parse_choice(os.getenv("TELEGRAM_LANGUAGE"), "en", {"en", "zh"}),
-            ai_visual_count_enabled=parse_bool(os.getenv("ENABLE_AI_VISUAL_COUNT"), False),
+            company_profile=os.getenv("COMPANY_PROFILE", "default").strip() or "default",
+            ai_visual_count_enabled=False,
             ai_visual_count_min_opencv_crops=parse_int(os.getenv("AI_VISUAL_COUNT_MIN_OPENCV_CROPS"), 4),
             pairing_mode=parse_choice(os.getenv("PAIRING_MODE"), "auto", {"auto", "review"}),
             local_confidence_threshold=parse_float(os.getenv("LOCAL_OCR_CONFIDENCE_THRESHOLD"), 0.62),

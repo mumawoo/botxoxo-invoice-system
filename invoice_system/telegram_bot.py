@@ -6,24 +6,30 @@ import json
 import os
 import re
 import errno
+import subprocess
 from datetime import datetime
+from datetime import date as Date
 from pathlib import Path
 
 from openpyxl import load_workbook
 
+from .company_profile import company_profile_status, company_profile_warning
 from .config import Settings
-from .expense_categories import normalize_expense_category
-from .models import InvoiceRecord, PipelineSummary
+from .expense_categories import EXPENSE_CATEGORIES, normalize_expense_category
+from .grouping import arm_next_group, clear_pending_group, load_pending_group, mark_source_for_group_if_armed, save_pending_group
+from .models import IMAGE_SUFFIXES, InvoiceRecord, PipelineSummary
 from .queue_worker import (
     DONE,
     FAILED_RETRYABLE,
     QueueItem,
+    block_rollback_for_manual_edit,
     discover_and_enqueue,
     enqueue_photo,
     format_status,
     load_queue_state,
     queue_totals_for_day,
     retry_failed,
+    rollback_last_photo,
     start_background_worker,
     summarize_queue,
     telegram_user_day_dir,
@@ -35,13 +41,15 @@ from .reimbursement import (
     format_reimbursement_summary,
     format_submit_result,
     refresh_checked_outputs,
-    rerun_finance_edits,
     submit_unsubmitted,
+    summary_food_average_per_day,
+    summary_period_days,
     submitted_batches_text,
     unsubmitted_summary,
 )
-from .reimbursement_excel import INVOICE_EXP_SHEET, REVIEW_CROPS_DIR, checked_workbook_path, focus_reimbursement_workbook
-from .reimbursement_excel import available_crop_ids, change_reimbursement_record
+from .reimbursement_excel import CROPS_DIR, INVOICE_EXP_SHEET, REVIEW_CROPS_DIR, checked_workbook_path, focus_reimbursement_workbook
+from .reimbursement_excel import apply_reimbursement_group, available_crop_ids, change_reimbursement_record, preview_reimbursement_group
+from .parsing import normalize_date
 
 SUBMIT_CONFIRM_WORDS = {"confirm", "yes", "ok", "\u786e\u8ba4", "\u63d0\u4ea4"}
 SUBMIT_CANCEL_WORDS = {"cancel", "no", "\u53d6\u6d88", "\u4e0d\u63d0\u4ea4"}
@@ -171,6 +179,20 @@ def telegram_photo_filename(timestamp: datetime, file_id: str, file_unique_id: s
     return f"{timestamp.strftime('%H%M%S')}_{identifier}.jpg"
 
 
+def telegram_image_document_filename(timestamp: datetime, file_id: str, original_name: str | None = None, file_unique_id: str | None = None) -> str:
+    identifier = _safe_filename_part(file_id) or _safe_filename_part(file_unique_id or "") or "telegram_file"
+    suffix = Path(str(original_name or "")).suffix.lower()
+    if suffix not in IMAGE_SUFFIXES:
+        suffix = ".jpg"
+    return f"{timestamp.strftime('%H%M%S')}_{identifier}{suffix}"
+
+
+def is_supported_telegram_image_document(document: object) -> bool:
+    mime_type = str(getattr(document, "mime_type", "") or "").casefold()
+    file_name = str(getattr(document, "file_name", "") or "")
+    return mime_type.startswith("image/") or Path(file_name).suffix.lower() in IMAGE_SUFFIXES
+
+
 def resolve_auto_process(settings: Settings, override: bool | None = None) -> bool:
     return settings.telegram_auto_process if override is None else override
 
@@ -203,7 +225,19 @@ def telegram_start_message(settings: Settings, lang: str = LANG_EN) -> str:
 
 def telegram_help_message(lang: str = LANG_EN) -> str:
     title = "命令" if is_zh(lang) else "Commands"
-    return "\n".join([title, *[f"/{command} - {description}" for command, description in telegram_command_menu(lang)]])
+    lines = [title, *[f"/{command} - {description}" for command, description in telegram_command_menu(lang)]]
+    lines.extend(
+        [
+            "",
+            "Available type/category values:",
+            ", ".join(EXPENSE_CATEGORIES),
+            "Short examples:",
+            "/change 021 other",
+            "/change 021 gas",
+            "/change 021 date 2026-7-1",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def telegram_command_menu(lang: str = LANG_EN) -> list[tuple[str, str]]:
@@ -212,13 +246,14 @@ def telegram_command_menu(lang: str = LANG_EN) -> list[tuple[str, str]]:
             ("lang", "切换语言：/lang zh 或 /lang en"),
             ("change", "修改 crop：/change 021 type Other + 备注"),
             ("del", "删除 crop：/del 021"),
+            ("group", "分组票据：/group 或 /group 044 045"),
             ("excel", "下载当前人工复核 Excel"),
             ("checked", "下载财务版 Food/Other Excel"),
             ("crops", "发送最近 review crop 图片"),
             ("recent", "最近 2 次上传和 Excel 行"),
-            ("rerun", "从修改后的财务 Excel 重建"),
             ("report", "未提交报销汇总"),
             ("restart", "重试失败照片"),
+            ("rollback", "撤销最后一张照片"),
             ("submit", "先预览，再回复 confirm/cancel"),
             ("status", "队列状态"),
             ("whoami", "显示你的 Telegram user ID"),
@@ -228,13 +263,14 @@ def telegram_command_menu(lang: str = LANG_EN) -> list[tuple[str, str]]:
         ("lang", "switch language: /lang zh or /lang en"),
         ("change", "edit crop: /change 021 type Other + note"),
         ("del", "delete crop: /del 021"),
+        ("group", "group receipts: /group or /group 044 045"),
         ("excel", "download current reimbursement Excel"),
         ("checked", "download finance Food/Other Excel"),
         ("crops", "send latest review crop images"),
         ("recent", "last 2 uploads and Excel rows"),
-        ("rerun", "rebuild from edited finance Excel"),
         ("report", "unsubmitted reimbursement summary"),
         ("restart", "retry failed photos"),
+        ("rollback", "rollback last photo"),
         ("submit", "preview, then reply confirm/cancel"),
         ("status", "queue status"),
         ("whoami", "show your Telegram user ID"),
@@ -281,7 +317,7 @@ def report_message(settings: Settings, user_id: int, lang: str = LANG_EN) -> str
     summary = unsubmitted_summary(settings, user_id)
     summary = type(summary)(
         record_count=summary.record_count,
-        photo_count=queue.done,
+        photo_count=summary.record_count,
         total_amount=summary.total_amount,
         category_totals=summary.category_totals,
         codex_used=summary.codex_used,
@@ -398,7 +434,7 @@ def change_message(settings: Settings, user_id: int, args: list[str], lang: str 
     try:
         parsed = _parse_change_args(args)
         result = change_reimbursement_record(output_dir, **parsed)
-        checked = refresh_checked_outputs(settings, user_id)
+        block_rollback_for_manual_edit(settings, user_id, "/change was used")
     except LookupError as exc:
         recent = ", ".join(available_crop_ids(output_dir)) or "none"
         if is_zh(lang):
@@ -421,26 +457,25 @@ def change_message(settings: Settings, user_id: int, args: list[str], lang: str 
             return f"{exc}\n用法: /change 021 type Other amount 33.35 currency USD + 备注"
         return f"{exc}\nUsage: /change 021 type Other amount 33.35 currency USD + comment"
     changed = _changed_fields_text(result.before, result.after)
-    missing = f"\n缺失 crops: {len(checked.missing_crops)}" if is_zh(lang) and checked.missing_crops else f"\nMissing crops: {len(checked.missing_crops)}" if checked.missing_crops else ""
     if is_zh(lang):
         return "\n".join(
             [
-                "修改已保存",
+                "Change saved / 人工表修改已保存",
                 f"Crop: {result.crop_id}",
                 f"商户: {result.merchant}",
                 f"状态: {result.status}",
                 changed or "已修改: 仅状态",
-                f"Checked 行/crops: {checked.records_written}/{checked.crops_written}{missing}",
+                "需要财务版时发送 /checked",
             ]
         )
     return "\n".join(
         [
-            "Change saved",
+            "Change saved / Manual Excel updated",
             f"Crop: {result.crop_id}",
             f"Merchant: {result.merchant}",
             f"Status: {result.status}",
             changed or "Changed: status only",
-            f"Checked rows/crops: {checked.records_written}/{checked.crops_written}{missing}",
+            "Send /checked when you need the finance version.",
         ]
     )
 
@@ -452,7 +487,7 @@ def delete_message(settings: Settings, user_id: int, args: list[str], lang: str 
     output_dir = telegram_user_output_dir(settings, user_id)
     try:
         results = [change_reimbursement_record(output_dir, crop_id, status="delete") for crop_id in crop_ids]
-        checked = refresh_checked_outputs(settings, user_id)
+        block_rollback_for_manual_edit(settings, user_id, "/del was used")
     except LookupError as exc:
         recent = ", ".join(available_crop_ids(output_dir)) or "none"
         if is_zh(lang):
@@ -474,73 +509,157 @@ def delete_message(settings: Settings, user_id: int, args: list[str], lang: str 
         if is_zh(lang):
             return f"{exc}\n用法: /del 021 或 /del 021 022"
         return f"{exc}\nUsage: /del 021 or /del 021 022"
-    lines = ["已删除" if is_zh(lang) else "Deleted", f"Crops: {', '.join(result.crop_id for result in results)}"]
+    lines = ["Deleted / 人工表已标记删除" if is_zh(lang) else "Deleted / marked in manual Excel", f"Crops: {', '.join(result.crop_id for result in results)}"]
     if len(results) == 1:
         lines.append(f"{'商户' if is_zh(lang) else 'Merchant'}: {results[0].merchant}")
     else:
         lines.append(f"{'数量' if is_zh(lang) else 'Count'}: {len(results)}")
-    lines.append(f"{'Checked 行/crops' if is_zh(lang) else 'Checked rows/crops'}: {checked.records_written}/{checked.crops_written}")
+    lines.append("需要财务版时发送 /checked" if is_zh(lang) else "Send /checked when you need the finance version.")
     return "\n".join(lines)
 
 
-def rerun_message(settings: Settings, user_id: int, lang: str = LANG_EN) -> str:
+
+def group_message(settings: Settings, user_id: int, args: list[str], lang: str = LANG_EN) -> str:
+    output_dir = telegram_user_output_dir(settings, user_id)
+    normalized = [str(arg or "").strip() for arg in args if str(arg or "").strip()]
+    if not normalized:
+        arm_next_group(output_dir)
+        if is_zh(lang):
+            return "\n".join(
+                [
+                    "Group mode is ready.",
+                    "The next uploaded photo will be forced into one manual Excel row with one combined crop image.",
+                    "Send /group cancel if this was a mistake.",
+                ]
+            )
+        return "\n".join(
+            [
+                "Group mode is ready.",
+                "The next uploaded photo will be forced into one manual Excel row with one combined crop image.",
+                "Send /group cancel if this was a mistake.",
+            ]
+        )
+    command = normalized[0].casefold()
+    if command == "cancel":
+        clear_pending_group(output_dir)
+        return "Group cancelled. No Excel rows or crops changed."
+    if command == "confirm":
+        pending = load_pending_group(output_dir)
+        if not pending:
+            return "No pending group. Use /group 044 045 first."
+        try:
+            result = apply_reimbursement_group(output_dir, list(pending))
+            clear_pending_group(output_dir)
+            block_rollback_for_manual_edit(settings, user_id, "/group was used")
+        except FileNotFoundError:
+            return "No reimbursement Excel yet, or crop images are missing."
+        except LookupError as exc:
+            recent = ", ".join(available_crop_ids(output_dir)) or "none"
+            return f"{exc}\nRecent crops: {recent}"
+        except PermissionError:
+            return "Excel is open/locked. Close it and resend /group confirm."
+        except OSError as exc:
+            return f"Excel or crop files are unavailable. Close Excel and resend /group confirm.\n{exc}"
+        except ValueError as exc:
+            return f"{exc}"
+        return _format_group_result(result, preview=False, lang=lang)
+
+    crop_ids = _delete_crop_ids(normalized)
+    if len(crop_ids) < 2:
+        return "\n".join(["Group receipts", "Usage:", "/group", "/group 044 045", "/group confirm", "/group cancel"])
     try:
-        result = rerun_finance_edits(settings, user_id)
-    except FileNotFoundError as exc:
-        missing = Path(str(exc).strip() or "").name or "checked/baseline"
-        if is_zh(lang):
-            return f"无法 rerun：缺少 {missing}。\n请先用 /report 生成财务 Excel，然后修改财务 Excel 后再发 /rerun。"
-        return f"Cannot rerun: missing {missing}.\nUse /report to generate the finance Excel, edit it, then send /rerun."
+        result = preview_reimbursement_group(output_dir, crop_ids)
+        save_pending_group(output_dir, list(result.crop_ids))
+    except FileNotFoundError:
+        return "No reimbursement Excel yet. Send photos first."
+    except LookupError as exc:
+        recent = ", ".join(available_crop_ids(output_dir)) or "none"
+        return f"{exc}\nRecent crops: {recent}"
     except PermissionError:
-        if is_zh(lang):
-            return "Excel 已打开/锁定。请关闭财务 Excel 后重新发送 /rerun。"
-        return "Excel is open/locked. Close the finance Excel and resend /rerun."
+        return "Excel is open/locked. Close it and resend /group."
     except OSError as exc:
-        if is_zh(lang):
-            return f"Excel 已打开/锁定或不可用。请关闭后重新发送 /rerun。\n{exc}"
-        return f"Excel is open/locked or unavailable. Close it and resend /rerun.\n{exc}"
+        return f"Excel or crop files are unavailable. Close Excel and resend /group.\n{exc}"
     except ValueError as exc:
-        if is_zh(lang):
-            return f"无法 rerun：{exc}"
-        return f"Cannot rerun: {exc}"
-    if not result.moved and not result.changed:
-        if is_zh(lang):
-            return "Rerun：没有发现财务 Excel 和 baseline 的差异。未重建文件。"
-        return "Rerun: no differences found between the finance Excel and baseline. Nothing rebuilt."
-    if is_zh(lang):
-        lines = [
-            "Rerun 完成",
-            f"Checked 行/crops: {result.records_written}/{result.crops_written}",
-            f"归档: {result.archive_dir}",
-        ]
-        if result.moved:
-            lines.append("移动:")
-            lines.extend(f"- {item}" for item in result.moved)
-        if result.changed:
-            lines.append("财务行内容变化:")
-            lines.extend(f"- {item}" for item in result.changed)
-        if result.warnings:
-            lines.append("警告:")
-            lines.extend(f"- {item}" for item in result.warnings[:5])
-        lines.append("新的人工表、checked Excel 和 final_crops 已重建。/change 和 /del 仍可继续使用。")
-        return "\n".join(lines)
+        return f"{exc}"
+    return _format_group_result(result, preview=True, lang=lang)
+
+
+def _format_group_result(result, *, preview: bool, lang: str = LANG_EN) -> str:
+    title = "Group preview" if preview else "Group saved"
     lines = [
-        "Rerun complete",
-        f"Checked rows/crops: {result.records_written}/{result.crops_written}",
-        f"Archive: {result.archive_dir}",
+        title,
+        f"Crops: {' + '.join(result.crop_ids)}",
+        f"Keep Trace ID: {result.primary_id}",
     ]
-    if result.moved:
-        lines.append("Moved:")
-        lines.extend(f"- {item}" for item in result.moved)
-    if result.changed:
-        lines.append("Finance row value changes:")
-        lines.extend(f"- {item}" for item in result.changed)
+    if result.deleted_ids:
+        lines.append(f"Mark delete: {', '.join(result.deleted_ids)}")
+    lines.extend(
+        [
+            f"Merchant: {result.seller}",
+            f"Date: {result.invoice_date or 'unknown'}",
+            f"Type: {result.category}",
+            f"Amount: {result.currency} {result.total_amount:.2f}",
+            f"Tips: {result.currency} {result.tips:.2f}",
+        ]
+    )
+    if result.crop_path:
+        lines.append(f"Combined crop: {result.crop_path.name}")
+    if result.archive_dir:
+        lines.append(f"Archive: {result.archive_dir}")
     if result.warnings:
         lines.append("Warnings:")
-        lines.extend(f"- {item}" for item in result.warnings[:5])
-    lines.append("New manual workbook, checked Excel, and final_crops were rebuilt. /change and /del still work.")
+        lines.extend(f"- {warning}" for warning in result.warnings)
+    if preview:
+        lines.extend(["", "Reply with /group confirm to apply, or /group cancel to stop."])
+    else:
+        lines.extend(["", "Manual Excel updated. Send /checked when you need the finance version."])
     return "\n".join(lines)
 
+
+def rollback_message(settings: Settings, user_id: int, lang: str = LANG_EN) -> str:
+    try:
+        result = rollback_last_photo(settings, user_id)
+    except LookupError as exc:
+        if is_zh(lang):
+            return "没有可回滚的最近照片。"
+        return f"Cannot rollback: {exc}"
+    except RuntimeError as exc:
+        text = str(exc)
+        if "Rollback is disabled" in text:
+            if is_zh(lang):
+                return "已用过 /change 或 /del，本批次不能再 /rollback。请继续用 /del 修正，或提交后开始新批次。"
+            return "Rollback is disabled after /change or /del. Use /del for fixes, or submit and start a new batch."
+        if is_zh(lang):
+            return "最后一张照片正在扫描或状态不适合回滚，请稍后再试。"
+        return f"Cannot rollback: {exc}"
+    except PermissionError:
+        if is_zh(lang):
+            return "Excel 已打开或被锁定。请关闭后重新发送 /rollback。"
+        return "Excel is open/locked. Close it and resend /rollback."
+    except OSError as exc:
+        if is_zh(lang):
+            return f"Excel 或文件不可用。请关闭后重新发送 /rollback。\n{exc}"
+        return f"Excel or files are unavailable. Close them and resend /rollback.\n{exc}"
+    traces = ", ".join(result.trace_ids) if result.trace_ids else "none"
+    if is_zh(lang):
+        detail = f"删除 Trace ID: {traces}" if result.trace_ids else "最近照片已从队列移除"
+        return "\n".join(
+            [
+                "已撤销最近一张照片",
+                detail,
+                f"删除行/crops: {result.manual_rows_deleted}/{result.crop_files_deleted}",
+                "请重新拍照发送。",
+            ]
+        )
+    detail = f"Removed Trace IDs: {traces}" if result.trace_ids else "Latest photo removed from queue"
+    return "\n".join(
+        [
+            "Rolled back latest photo",
+            detail,
+            f"Deleted rows/crops: {result.manual_rows_deleted}/{result.crop_files_deleted}",
+            "Retake and send the photo again.",
+        ]
+    )
 
 def _delete_crop_ids(args: list[str]) -> list[str]:
     crop_ids: list[str] = []
@@ -586,10 +705,10 @@ def _delete_usage_message(lang: str = LANG_EN) -> str:
 
 
 def review_crop_paths(settings: Settings, user_id: int) -> list[Path]:
-    refresh_checked_outputs(settings, user_id)
     output_dir = telegram_user_output_dir(settings, user_id)
-    crops_dir = output_dir / REVIEW_CROPS_DIR
-    crop_paths = _review_crop_files(crops_dir)
+    crop_paths = _review_crop_files(output_dir / CROPS_DIR)
+    if not crop_paths:
+        crop_paths = _review_crop_files(output_dir / REVIEW_CROPS_DIR)
     latest = _latest_done_item(settings, user_id)
     if latest is None:
         return crop_paths
@@ -622,12 +741,13 @@ def _parse_change_args(args: list[str]) -> dict[str, object]:
         raise ValueError("Missing change details")
     crop_id = args[0]
     status = "ok"
+    invoice_date: str | None = None
     category: str | None = None
     amount: float | None = None
     currency: str | None = None
     comment: str | None = None
     tokens = args[1:]
-    keys = {"type", "category", "cat", "amount", "amt", "currency", "cur"}
+    keys = {"date", "day", "invoice_date", "type", "category", "cat", "amount", "amt", "currency", "cur"}
     statuses = {"ok", "correct", "corrected"}
     index = 0
     saw_change = False
@@ -644,8 +764,29 @@ def _parse_change_args(args: list[str]) -> dict[str, object]:
             saw_change = True
             index += 1
             continue
+        bare_date = _normalize_change_date(tokens[index])
+        if bare_date:
+            invoice_date = bare_date
+            saw_change = True
+            index += 1
+            continue
         if token not in keys:
-            raise ValueError(f"Unknown /change token: {tokens[index]}")
+            value_parts = []
+            while (
+                index < len(tokens)
+                and tokens[index] != "+"
+                and tokens[index].casefold() not in keys
+                and tokens[index].casefold() not in statuses
+                and not _normalize_change_date(tokens[index])
+            ):
+                value_parts.append(tokens[index])
+                index += 1
+            shorthand_category = _category_from_shorthand(" ".join(value_parts))
+            if shorthand_category:
+                category = shorthand_category
+                saw_change = True
+                continue
+            raise ValueError(f"Unknown /change token: {tokens[index - len(value_parts)] if value_parts else tokens[index]}")
         index += 1
         value_parts: list[str] = []
         while index < len(tokens) and tokens[index] != "+" and tokens[index].casefold() not in keys and tokens[index].casefold() not in statuses:
@@ -654,7 +795,12 @@ def _parse_change_args(args: list[str]) -> dict[str, object]:
         if not value_parts:
             raise ValueError(f"Missing value after {token}")
         value = " ".join(value_parts)
-        if token in {"type", "category", "cat"}:
+        if token in {"date", "day", "invoice_date"}:
+            normalized_date = _normalize_change_date(value)
+            if not normalized_date:
+                raise ValueError(f"Invalid date: {value}")
+            invoice_date = normalized_date
+        elif token in {"type", "category", "cat"}:
             category = value
         elif token in {"amount", "amt"}:
             try:
@@ -666,11 +812,118 @@ def _parse_change_args(args: list[str]) -> dict[str, object]:
         saw_change = True
     if not saw_change:
         raise ValueError("Missing change details")
-    return {"crop_id": crop_id, "category": category, "amount": amount, "currency": currency, "comment": comment, "status": status}
+    return {
+        "crop_id": crop_id,
+        "invoice_date": invoice_date,
+        "category": category,
+        "amount": amount,
+        "currency": currency,
+        "comment": comment,
+        "status": status,
+    }
+
+
+def _normalize_change_date(value: str) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = normalize_date(text.replace(".", "-"))
+    if normalized:
+        return normalized
+    chinese = re.fullmatch(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日?", text)
+    if chinese:
+        return _date_parts_to_iso(int(chinese.group(1)), int(chinese.group(2)), int(chinese.group(3)))
+    compact = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", text)
+    if compact:
+        return _date_parts_to_iso(int(compact.group(1)), int(compact.group(2)), int(compact.group(3)))
+    numeric = re.fullmatch(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2,4})", text)
+    if numeric:
+        first = int(numeric.group(1))
+        second = int(numeric.group(2))
+        year = _normalize_year(int(numeric.group(3)))
+        if first > 12:
+            day, month = first, second
+        elif second > 12:
+            month, day = first, second
+        else:
+            day, month = first, second
+        return _date_parts_to_iso(year, month, day)
+    for pattern in (
+        "%B %d %Y",
+        "%b %d %Y",
+        "%d %B %Y",
+        "%d %b %Y",
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%d %B, %Y",
+        "%d %b, %Y",
+    ):
+        try:
+            return datetime.strptime(text, pattern).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _category_from_shorthand(value: str) -> str | None:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return None
+    chinese_aliases = {
+        "\u9910\u996e": "Food",
+        "\u5403\u996d": "Food",
+        "\u98df\u7269": "Food",
+        "\u6c7d\u6cb9": "Gas",
+        "\u52a0\u6cb9": "Gas",
+        "\u6cb9\u8d39": "Gas",
+        "\u8f66\u8f86\u7ef4\u4fee": "Car repair",
+        "\u4fee\u8f66": "Car repair",
+        "\u8fc7\u8def\u8d39": "Toll/Parking",
+        "\u505c\u8f66\u8d39": "Toll/Parking",
+        "\u505c\u8f66": "Toll/Parking",
+        "\u8fc7\u8def\u8d39\u505c\u8f66\u8d39": "Toll/Parking",
+        "\u6c34\u7535\u7164": "Utilities",
+        "\u6c34\u8d39": "Utilities",
+        "\u7535\u8d39": "Utilities",
+        "\u7164\u6c14": "Utilities",
+        "\u7f51\u7edc\u8d39": "Internet",
+        "\u7f51\u8d39": "Internet",
+        "\u7535\u8bdd\u8d39": "Phone",
+        "\u8bdd\u8d39": "Phone",
+        "\u529e\u516c\u7528\u54c1": "Office supplies",
+        "\u529e\u516c": "Office supplies",
+        "\u4f4f\u5bbf": "Hotel",
+        "\u9152\u5e97": "Hotel",
+        "\u673a\u7968": "Flight",
+        "\u98de\u673a\u7968": "Flight",
+        "\u5176\u4ed6": "Other",
+    }
+    if text in chinese_aliases:
+        return chinese_aliases[text]
+    for category_name in EXPENSE_CATEGORIES:
+        if category_name.casefold() == text.casefold():
+            return category_name
+    normalized = normalize_expense_category(text)
+    if normalized != "Other" or text.casefold() in {"other", "\u5176\u4ed6"}:
+        return normalized
+    return None
+
+
+def _normalize_year(value: int) -> int:
+    if value < 100:
+        return 2000 + value if value < 70 else 1900 + value
+    return value
+
+
+def _date_parts_to_iso(year: int, month: int, day: int) -> str | None:
+    try:
+        return Date(year, month, day).isoformat()
+    except ValueError:
+        return None
 
 
 def _changed_fields_text(before: dict[str, object], after: dict[str, object]) -> str:
-    labels = ["Type", "Accounting Category", "MXN Amount", "\u539f\u5e01\u79cd", "\u539f\u91d1\u989d", "\u6c47\u7387", "Detail", "Manual status"]
+    labels = ["Date", "Type", "Accounting Category", "MXN Amount", "\u539f\u5e01\u79cd", "\u539f\u91d1\u989d", "\u6c47\u7387", "Detail", "Manual status"]
     lines: list[str] = []
     for label in labels:
         old = before.get(label)
@@ -699,9 +952,10 @@ def format_telegram_config(settings: Settings, auto_process: bool | None = None)
         f"Allowed user IDs: {allowed_count if allowed_count else 'missing'}",
         f"Auto process: {'enabled' if resolve_auto_process(settings, auto_process) else 'disabled'}",
         f"Telegram language: {normalize_telegram_language(settings.telegram_language)}",
+        f"Company profile: {company_profile_status(settings.company_profile, settings.root)}",
         f"Inbound photo folder: {settings.inbound_dir / 'telegram' / '<telegram_user_id>' / 'YYYY-MM-DD'}",
         f"Qwen OCR: {'enabled' if settings.qwen_api_key else 'disabled'}",
-        f"Codex Scan fallback: {'enabled' if settings.codex_scan_enabled and settings.openai_api_key else 'disabled'}",
+        "OpenAI fallback: removed",
         f"Polling startup: {'READY' if telegram_polling_ready(settings) else 'NOT READY'}",
         f"Photo ingestion: {'READY' if telegram_config_ready(settings) else 'NOT READY'}",
     ]
@@ -713,6 +967,9 @@ def format_telegram_config(settings: Settings, auto_process: bool | None = None)
         lines.append("Set TELEGRAM_ALLOWED_USER_IDS before sending photos; empty allow-list rejects all photos.")
     if settings.telegram_bot_token and not settings.telegram_allowed_user_ids:
         lines.append("Polling can start for /whoami, but receipt photos will be rejected until allowed IDs are set.")
+    profile_warning = company_profile_warning(settings.company_profile, settings.root)
+    if profile_warning:
+        lines.append(f"Company profile warning: {profile_warning}")
     lines.append(f"Status: {'READY' if telegram_config_ready(settings) else 'NOT READY'}")
     return "\n".join(lines)
 
@@ -856,7 +1113,6 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
         if not workbook.exists():
             await message.reply_text(status_message(settings, user.id, user_language(settings, user.id)))
             return
-        refresh_checked_outputs(settings, user.id)
         try:
             focus_reimbursement_workbook(workbook)
         except OSError:
@@ -937,14 +1193,23 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
             return
         await message.reply_text(delete_message(settings, user.id, list(context.args or []), user_language(settings, user.id)))
 
-    async def rerun(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    async def group_crop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await reply_not_allowed(update):
             return
         message = update.effective_message
         user = update.effective_user
         if message is None or user is None:
             return
-        await message.reply_text(rerun_message(settings, user.id, user_language(settings, user.id)))
+        await message.reply_text(group_message(settings, user.id, list(context.args or []), user_language(settings, user.id)))
+
+    async def rollback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if await reply_not_allowed(update):
+            return
+        message = update.effective_message
+        user = update.effective_user
+        if message is None or user is None:
+            return
+        await message.reply_text(rollback_message(settings, user.id, user_language(settings, user.id)))
 
     async def photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
@@ -967,6 +1232,7 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
         day_dir.mkdir(parents=True, exist_ok=True)
         target = day_dir / telegram_photo_filename(now, photo_size.file_id, photo_size.file_unique_id)
         await telegram_file.download_to_drive(custom_path=Path(target))
+        grouped_upload = mark_source_for_group_if_armed(telegram_user_output_dir(settings, user.id), target)
         enqueue_photo(settings, user.id, target, now)
 
         should_process = resolve_auto_process(settings, auto_process)
@@ -976,9 +1242,56 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
                 user.id,
                 item_callback=_telegram_item_notifier(settings, context.bot, asyncio.get_running_loop()),
             )
-            await message.reply_text(queued_photo_message(target, started, user_language(settings, user.id)))
+            reply = queued_photo_message(target, started, user_language(settings, user.id))
+            if grouped_upload:
+                reply += "\nGroup: this photo will be forced into one Excel row."
+            await message.reply_text(reply)
         else:
-            await message.reply_text(saved_photo_message(target, user_language(settings, user.id)))
+            reply = saved_photo_message(target, user_language(settings, user.id))
+            if grouped_upload:
+                reply += "\nGroup: this photo will be forced into one Excel row."
+            await message.reply_text(reply)
+
+    async def image_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        message = update.effective_message
+        user = update.effective_user
+        if message is None or user is None:
+            return
+        if not is_allowed_user(user.id, settings.telegram_allowed_user_ids):
+            lang = user_language(settings, user.id)
+            await message.reply_text("这个 Telegram 用户没有权限。" if is_zh(lang) else "This Telegram user is not allowed.")
+            return
+        document = message.document
+        lang = user_language(settings, user.id)
+        if document is None or not is_supported_telegram_image_document(document):
+            await message.reply_text("请发送图片文件，或普通照片。" if is_zh(lang) else "Please send an image file, or a normal photo.")
+            return
+
+        telegram_file = await context.bot.get_file(document.file_id)
+        now = datetime.now()
+        day_dir = telegram_user_day_dir(settings, user.id, now)
+        day_dir.mkdir(parents=True, exist_ok=True)
+        target = day_dir / telegram_image_document_filename(now, document.file_id, document.file_name, getattr(document, "file_unique_id", None))
+        await telegram_file.download_to_drive(custom_path=Path(target))
+        grouped_upload = mark_source_for_group_if_armed(telegram_user_output_dir(settings, user.id), target)
+        enqueue_photo(settings, user.id, target, now)
+
+        should_process = resolve_auto_process(settings, auto_process)
+        if should_process:
+            started = start_background_worker(
+                settings,
+                user.id,
+                item_callback=_telegram_item_notifier(settings, context.bot, asyncio.get_running_loop()),
+            )
+            reply = queued_photo_message(target, started, lang)
+            if grouped_upload:
+                reply += "\nGroup: this photo will be forced into one Excel row."
+            await message.reply_text(reply)
+        else:
+            reply = saved_photo_message(target, lang)
+            if grouped_upload:
+                reply += "\nGroup: this photo will be forced into one Excel row."
+            await message.reply_text(reply)
 
     app = Application.builder().token(settings.telegram_bot_token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
@@ -992,7 +1305,8 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
     app.add_handler(CommandHandler("crops", crops))
     app.add_handler(CommandHandler("change", change))
     app.add_handler(CommandHandler("del", delete_crop))
-    app.add_handler(CommandHandler("rerun", rerun))
+    app.add_handler(CommandHandler("group", group_crop))
+    app.add_handler(CommandHandler("rollback", rollback))
     app.add_handler(CommandHandler("today_excel", excel))
     app.add_handler(CommandHandler("report", report))
     app.add_handler(CommandHandler("recent", recent))
@@ -1000,6 +1314,8 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
     app.add_handler(CommandHandler("submitted", submitted))
     app.add_handler(CommandHandler("submit", submit))
     app.add_handler(MessageHandler(filters.PHOTO, photo))
+    document_filter = getattr(filters.Document, "IMAGE", filters.Document.ALL)
+    app.add_handler(MessageHandler(document_filter, image_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_message))
     try:
         app.run_polling()
@@ -1015,7 +1331,7 @@ def _acquire_telegram_instance_lock(settings: Settings) -> Path:
             fd = os.open(str(lock_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         except FileExistsError:
             existing_pid = _read_pid_file(lock_path)
-            if existing_pid and _pid_is_running(existing_pid):
+            if existing_pid and _pid_is_active_telegram_bot(existing_pid):
                 raise RuntimeError(f"Telegram bot already running with PID {existing_pid}. Stop that process before starting another one.")
             try:
                 lock_path.unlink()
@@ -1064,6 +1380,41 @@ def _pid_is_running(pid: int) -> bool:
         return True
     except OSError:
         return False
+
+
+def _pid_is_active_telegram_bot(pid: int) -> bool:
+    if pid == os.getpid():
+        return True
+    if not _pid_is_running(pid):
+        return False
+    if os.name != "nt":
+        return True
+    command_line = _windows_process_command_line(pid)
+    if not command_line:
+        return False
+    lowered = command_line.lower()
+    return "-m invoice_system" in lowered and "telegram" in lowered
+
+
+def _windows_process_command_line(pid: int) -> str:
+    try:
+        completed = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                f"(Get-CimInstance Win32_Process -Filter \"ProcessId = {int(pid)}\").CommandLine",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return ""
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip()
 
 
 def _telegram_item_notifier(settings: Settings, bot, loop: asyncio.AbstractEventLoop):
@@ -1141,6 +1492,9 @@ def _format_reimbursement_summary(summary, title: str = "报销汇总 / 未提�
     ]
     if summary.date_min or summary.date_max:
         lines.append(f"日期范围: {summary.date_min or '-'} 到 {summary.date_max or '-'}")
+        days = summary_period_days(summary)
+        if days:
+            lines.append(f"共 {days} 天，Food 平均每天 {summary_food_average_per_day(summary):.2f} MXN")
     if summary.category_totals:
         lines.append("按类别:")
         for category, amount in sorted(summary.category_totals.items()):
@@ -1184,9 +1538,22 @@ def _format_scan_record_lines(records: list[InvoiceRecord]) -> list[str]:
         seller = str(record.seller or "Unknown").strip() or "Unknown"
         invoice_date = str(record.invoice_date or "unknown-date").strip() or "unknown-date"
         lines.append(f"- {index} {invoice_date} {category}: {currency} {amount:.2f} | {seller}")
+        duplicate_notice = _possible_duplicate_notice(record)
+        if duplicate_notice:
+            lines.append(f"  {duplicate_notice}")
         if len(crop_ids) > 1:
             lines.append(f"  Combined: {' + '.join(crop_ids)} -> one Excel row; crops kept as a/b")
     return lines
+
+
+def _possible_duplicate_notice(record: InvoiceRecord) -> str:
+    remarks = str(record.remarks or "")
+    if "possible duplicate" not in remarks.casefold():
+        return ""
+    match = re.search(r"possible duplicate with\s+([^;,\n]+)", remarks, flags=re.IGNORECASE)
+    if match:
+        return f"Possible duplicate with {match.group(1).strip()}; please review in Excel"
+    return "Possible duplicate; please review in Excel"
 
 
 def _crop_id_from_record(record: InvoiceRecord) -> str:

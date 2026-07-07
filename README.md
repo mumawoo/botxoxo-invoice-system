@@ -1,199 +1,215 @@
-# Windows Dual-OCR Invoice System
+# Botxoxo Invoice System
 
-Windows-native rewrite of the Xuan invoice processing pipeline from the V2
-project summary document.
+Windows-native receipt and reimbursement automation for small-team expense
+workflows. The system receives receipt photos, splits multi-receipt images with
+OpenCV, sends each crop to Qwen vision OCR, and writes a traceable manual-review
+Excel workbook. Finance exports are generated only when requested, so daily
+scanning stays fast and local.
 
-## Commands
+## What It Does
 
-On this Windows PC, the tested runtime is:
+- Ingests receipt photos from Telegram polling or local folders.
+- Splits photos containing multiple receipts into individual crop images.
+- Sends each crop to Qwen OCR and normalizes seller, date, amount, currency,
+  tax, tips, and category.
+- Writes a manual reimbursement workbook for human review.
+- Supports Telegram correction commands such as `/change`, `/del`, `/group`,
+  `/rollback`, `/excel`, `/report`, `/checked`, and `/submit`.
+- Keeps company-specific category rules outside the bot code in JSON profiles.
+- Builds a clean finance package on demand: checked Excel plus final crop images
+  split into `food` and `other` folders.
+- Includes a Windows Workbench launcher for non-technical daily operation.
+
+## Privacy Model
+
+Runtime business data stays local. Do not commit real receipts, Telegram photos,
+crop images, reimbursement Excel files, logs, archives, bot tokens, or API keys.
+The repository `.gitignore` excludes `.env`, `data/*`, Excel files, zip files,
+and logs by default. Only reusable sample assets under `data/samples/` are meant
+to be tracked.
+
+If a real token or API key was ever pasted into a chat, screenshot, or local
+file, rotate it before publishing or sharing the project.
+
+## Quick Start
+
+Use Python 3.11+ on Windows. Create a virtual environment if you are not using
+the bundled Codex runtime.
 
 ```powershell
-& 'C:\Users\donxi\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m invoice_system check --strict
+python -m pip install -r requirements.txt
+Copy-Item .env.example .env
+python -m invoice_system check --create-dirs
+python -m invoice_system check --strict
 ```
 
-If `python` already points to the correct Python installation on another Windows
-machine, these shorter commands are equivalent:
+Edit `.env` and add your own credentials:
+
+```env
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_ALLOWED_USER_IDS=
+TELEGRAM_AUTO_PROCESS=false
+TELEGRAM_LANGUAGE=en
+COMPANY_PROFILE=default
+
+QWEN_API_KEY=
+QWEN_MODEL=qwen-vl-max
+QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+ENABLE_QWEN_SCAN=false
+```
+
+`QWEN_API_KEY` is required for production OCR. `DASHSCOPE_API_KEY` is also
+accepted as an alias. OpenAI/Codex fallback is not used in production scanning.
+
+## Windows Workbench
+
+The Workbench is included in the downloadable GitHub source package:
+
+```powershell
+.\scripts\workbench.cmd
+```
+
+It opens a Windows Forms control panel for common actions:
+
+- Start or restart the Telegram bot with auto scan.
+- Stop running bot PIDs and close the panel.
+- Check queue status and running PIDs.
+- Process pending photos once.
+- Retry failed photos.
+- Open the manual Excel workbook, crop folder, output folder, `.env`, and
+  checked finance output.
+- Build checked Excel/final crops and submit reimbursement batches.
+
+The Workbench uses `INVOICE_SYSTEM_PYTHON` when set, then the bundled Codex
+Python runtime if present, then `python`.
+
+## Telegram Setup
+
+1. Create a Telegram bot with BotFather.
+2. Copy `.env.example` to `.env`.
+3. Paste the bot token into `TELEGRAM_BOT_TOKEN`.
+4. Run:
+
+   ```powershell
+   python -m invoice_system telegram --check
+   ```
+
+5. Start polling:
+
+   ```powershell
+   python -m invoice_system telegram --no-process
+   ```
+
+6. Send `/whoami` to the bot and put your numeric user ID into
+   `TELEGRAM_ALLOWED_USER_IDS`.
+7. Restart with auto scan:
+
+   ```powershell
+   python -m invoice_system telegram --process
+   ```
+
+The bot uses polling, so no public HTTPS webhook is required. Photos are saved
+per Telegram user under `data/inbound/telegram/<telegram_user_id>/YYYY-MM-DD/`.
+Output is isolated per user under `data/output/telegram/<telegram_user_id>/`.
+
+## Mobile Commands
+
+- `/status` shows queue state and bot PID.
+- `/excel` sends the manual-review workbook.
+- `/report` summarizes valid unsubmitted records from the manual workbook.
+- `/change 021 type Gas` edits a crop record by Trace ID.
+- `/change 021 2026-07-01` edits the date.
+- `/change 021 + client dinner` adds a note.
+- `/del 021 022` marks crop rows deleted.
+- `/group` arms the next uploaded photo as one grouped receipt set.
+- `/group 044 045` previews grouping existing crops.
+- `/group confirm` applies the pending group.
+- `/rollback` removes the most recent Telegram photo if it has not been manually
+  changed after scanning.
+- `/crops` sends recent crop screenshots for review.
+- `/checked` builds and sends the finance checked workbook.
+- `/submit` previews submission; send `confirm` only after review.
+- `/lang zh` or `/lang en` changes reply language.
+
+## Data Flow
+
+1. Telegram or local input saves source photos.
+2. OpenCV splits the photo into crop images.
+3. Qwen OCR reads each crop and returns strict invoice fields plus orientation.
+4. The crop is rotated if needed and renamed with its Trace ID.
+5. The manual workbook `报销明细_2026_xlsx.xlsx` is updated.
+6. Human review happens in the manual workbook or through Telegram commands.
+7. `/checked` or `/submit confirm` generates `报销_checked_2026.xlsx` and
+   `final_crops/food|other`.
+
+Daily scanning does not rebuild finance outputs unless requested.
+
+## Company Profiles
+
+Company-specific category rules live in `rules/company_profiles/<profile>.json`.
+Set the active profile with:
+
+```env
+COMPANY_PROFILE=default
+```
+
+The default profile includes examples such as Walmart, Cordia/Cordial, and Codie
+being treated as `Food`. Manual changes made with `/change` or in the manual
+Excel workbook take priority over automatic rules.
+
+## CLI Reference
 
 ```powershell
 python -m invoice_system check --create-dirs
 python -m invoice_system check --strict
-python -m invoice_system prepare
-python -m invoice_system audit
 python -m invoice_system sample
 python -m invoice_system sample --multi
-python -m invoice_system run
-python -m invoice_system run --trial
-python -m invoice_system run --resume --input data/inbound/telegram/YYYY-MM-DD --output data/output/production
+python -m invoice_system run --trial --input data/samples/synthetic_receipt.jpg --output data/output/smoke
+python -m invoice_system telegram --check
 python -m invoice_system telegram --process
 python -m invoice_system worker --user-id 123456789 --once
 python -m invoice_system worker --user-id 123456789 --retry-failed
+python -m invoice_system worker --user-id 123456789 --reset-active
 python -m invoice_system reimburse report --user-id 123456789
 python -m invoice_system reimburse submit --user-id 123456789
-python -m invoice_system ab-test --user-id 123456789 --date 2026-06-16 --output data/output/ab_test
-python -m invoice_system compare --baseline data/baseline --candidate data/output/trial --output data/output/ubuntu_comparison_report.xlsx
+python -m invoice_system rebuild-final-crops --user-id 123456789
+python -m invoice_system fx update --user-id 123456789 --start-date 2025-10-10
+python -m invoice_system ab-test --user-id 123456789 --date YYYY-MM-DD
+python -m invoice_system orientation-ab-test --user-id 123456789 --limit 30
 ```
 
-PowerShell launchers are also available. They automatically try
-`INVOICE_SYSTEM_PYTHON`, then the bundled Codex Python runtime, then `python`:
+PowerShell helper scripts are available in `scripts/` for the same workflows.
+
+## Downloading From GitHub
+
+After the v1.0 release is public, users can download the whole project from the
+GitHub release page or with **Code -> Download ZIP**. The ZIP includes source
+code, tests, rules, sample data, PowerShell helpers, and the Windows Workbench.
+It does not include private runtime data.
+
+After unzipping:
 
 ```powershell
-.\scripts\check.ps1
-.\scripts\invoice.ps1 audit
-.\scripts\smoke.ps1
-.\scripts\smoke.ps1 -Multi
-.\scripts\run-trial.ps1
-.\scripts\telegram.ps1 --check
-.\scripts\telegram.ps1 --process
-.\scripts\telegram.ps1 --no-process
-.\scripts\worker.ps1 --user-id 123456789 --once
-.\scripts\worker.ps1 --user-id 123456789 --retry-failed
-.\scripts\reimburse.ps1 report --user-id 123456789
-.\scripts\reimburse.ps1 submit --user-id 123456789
-.\scripts\compare-ubuntu.ps1
-```
-
-For a smoke test without mixing sample data into `data/trial`, run:
-
-```powershell
-python -m invoice_system sample
-python -m invoice_system run --trial --input data/samples/synthetic_receipt.jpg --output data/output/smoke
-python -m invoice_system sample --multi
-python -m invoice_system run --trial --input data/samples/synthetic_receipts_multi.jpg --output data/output/smoke_multi
-```
-
-The equivalent Windows helper scripts run the actual local OCR engines:
-
-```powershell
-.\scripts\smoke.ps1
-.\scripts\smoke.ps1 -Multi
-```
-
-## Configuration
-
-Copy `.env.example` to `.env` when you are ready to use Telegram or Qwen Scan:
-
-```powershell
+cd botxoxo-invoice-system
+python -m pip install -r requirements.txt
 Copy-Item .env.example .env
+.\scripts\workbench.cmd
 ```
 
-```env
-TELEGRAM_BOT_TOKEN=123456:token
-TELEGRAM_ALLOWED_USER_IDS=123456789
-TELEGRAM_AUTO_PROCESS=false
-OPENAI_API_KEY=sk-...
-OPENAI_MODEL=gpt-4.1
-QWEN_API_KEY=sk-...
-QWEN_MODEL=qwen-vl-max
-ENABLE_QWEN_SCAN=true
-PADDLEOCR_LANG=en
-EASYOCR_LANGS=es,en
-TESSERACT_CMD=tesseract
-TESSERACT_LANG=eng+spa
-TESSERACT_PSM=6
-LOCAL_OCR_CONFIDENCE_THRESHOLD=0.62
-AMOUNT_TOLERANCE_MXN=0.50
-```
-
-`QWEN_API_KEY` is only needed when Qwen Scan fallback is enabled for local OCR
-disagreements, low confidence, missing fields, poor image quality, or A/B tests
-against PaddleOCR-VL. Paste the DashScope/Qwen compatible API key on the
-`QWEN_API_KEY=` line in `.env`; `DASHSCOPE_API_KEY` is also accepted as an alias.
-`TELEGRAM_BOT_TOKEN` is only needed for the Telegram polling bot.
-
-For A/B testing PaddleOCR-VL against Qwen on the same Telegram photos, run
-`python -m invoice_system ab-test --user-id 123456789 --date YYYY-MM-DD`.
-The output folder contains `paddleocr_vl/Invoice_Output.xlsx`,
-`qwen/Invoice_Output.xlsx`, and `AB_Comparison.xlsx`.
-
-## Flow
-
-1. Photos enter through `data/inbound/`, `data/trial/`, or Telegram polling.
-2. OpenCV splits multi-receipt photos into cropped invoice images.
-3. Each crop is scanned by EasyOCR and PaddleOCR.
-4. If both local OCR results agree on normalized date, seller, currency, total,
-   VAT/tax, and tips, the local result is written to Excel.
-5. If they disagree, PaddleOCR confidence is low, key fields are missing, or the
-   crop is poor quality, Qwen Scan is invoked when enabled.
-6. Qwen Scan output must validate as strict invoice JSON before it can replace
-   the local OCR result.
-7. Likely invoice/payment-slip pairs are merged so tip deltas are calculated.
-8. Output workbooks keep the original 13 invoice columns, preserve rows marked
-   `Manually checked` or `Deleted` in `Invoice_Manually_Checked.xlsx`, and
-   refresh that manual-review workbook after each run so it can be edited for
-   the next locked pass.
-
-## Telegram Setup
-
-1. In Telegram, open BotFather and create a bot.
-2. Copy `.env.example` to `.env`.
-3. Paste the bot token into `TELEGRAM_BOT_TOKEN`.
-4. Run `.\scripts\telegram.ps1 --check`.
-   `Polling startup: READY` means the bot can start for `/whoami`; `Photo ingestion: READY`
-   appears only after allowed IDs are configured.
-5. Run `.\scripts\telegram.ps1`.
-6. Send `/whoami` to the bot and copy the numeric ID into `TELEGRAM_ALLOWED_USER_IDS`.
-   Multiple IDs can be separated with commas, semicolons, or spaces.
-7. Run `.\scripts\telegram.ps1 --check` again.
-8. Restart with `.\scripts\telegram.ps1 --process`, or set
-   `TELEGRAM_AUTO_PROCESS=true` in `.env`.
-
-Receipt photos are rejected until `TELEGRAM_ALLOWED_USER_IDS` contains the
-sender's numeric ID. `/whoami` remains available during setup so you can get
-that ID safely. Mobile Telegram commands are intentionally small and safe:
-`/status`, `/restart`, `/today_excel`, `/report`, `/unsubmitted`, `/submitted`,
-`/submit`, and `/help`.
-
-Use `.\scripts\telegram.ps1 --no-process` when you want the bot to save photos
-without running OCR, even if `.env` enables auto-processing.
-
-The bot uses polling, so it can run on this Windows PC without a public HTTPS
-webhook. Incoming photos are saved per user under
-`data/inbound/telegram/<telegram_user_id>/YYYY-MM-DD/`; per-user output is under
-`data/output/telegram/<telegram_user_id>/`. When processing is enabled, the bot
-queues photos and starts a background scanner without blocking later uploads.
-The scanner refreshes Excel after each source photo and uses
-`processing_state.json` plus `queue_state.json` to resume after interruption.
-
-Use the fuller Windows/finance commands from PowerShell:
+## Development Checks
 
 ```powershell
-.\scripts\worker.ps1 --user-id 123456789 --once
-.\scripts\worker.ps1 --user-id 123456789 --retry-failed
-.\scripts\reimburse.ps1 report --user-id 123456789
-.\scripts\reimburse.ps1 unsubmitted --user-id 123456789
-.\scripts\reimburse.ps1 submitted --user-id 123456789
-.\scripts\reimburse.ps1 submit --user-id 123456789
+python -m unittest discover -s tests
 ```
 
-`reimburse submit` marks current unsubmitted rows as submitted, archives the
-current `Invoice_Output.xlsx` under `submitted/`, and resets active scan output
-so new photos start a fresh Excel workbook.
-
-## Ubuntu Comparison Handoff
-
-Place the Ubuntu output workbook and cropped images under `data/baseline/`, then
-run:
+Before publishing, also verify:
 
 ```powershell
-.\scripts\invoice.ps1 prepare
-.\scripts\run-trial.ps1 --resume
-.\scripts\compare-ubuntu.ps1
+git ls-files .env data *.xlsx *.xls *.zip *.log
 ```
 
-`run` exits with a clear error if the input folder has no photos. `compare` exits
-with a clear error if either side has no invoice workbook.
+Only reusable sample files should appear from `data/`.
 
-The invoice workbook includes an `OCR_Audit` sheet with PaddleOCR, EasyOCR, and
-Codex Scan text/error/confidence evidence for each crop. `Run_Summary` separates
-`Codex Scan attempted` from `Codex Scan used`, so an OCR mismatch with a missing
-API key is still visible as a triggered fallback. The comparison report includes
-`Summary`, `Comparison`, and `Crop Counts` sheets.
-Crop counts use `OCR_Audit` when available; otherwise they are inferred from
-crop filenames such as `photo_a_d01.jpg` or V2 row-numbered crop names.
-Comparison categories include exact match, near match, missing in Windows, extra
-in Windows, OCR disagreement resolved by Codex Scan, and field-level mismatch.
-Date formats, seller accents/case, currency aliases, and small amount differences
-are normalized during matching.
+## License
 
-Raw OCR crops are kept in `data/output/<mode>/crops/`. Row-numbered copies using
-the V2 naming style are written to `data/output/<mode>/final_crops/`.
+MIT License. See `LICENSE`.
