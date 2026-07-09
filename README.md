@@ -61,6 +61,9 @@ ENABLE_QWEN_SCAN=false
 `QWEN_API_KEY` is required for production OCR. `DASHSCOPE_API_KEY` is also
 accepted as an alias. OpenAI/Codex fallback is not used in production scanning.
 
+For a bilingual step-by-step setup guide, see
+[`INSTALLATION_USAGE_ZH_EN.md`](INSTALLATION_USAGE_ZH_EN.md).
+
 ## Windows Workbench
 
 The Workbench is included in the downloadable GitHub source package:
@@ -68,6 +71,8 @@ The Workbench is included in the downloadable GitHub source package:
 ```powershell
 .\scripts\workbench.cmd
 ```
+
+The startup file is `scripts/workbench.cmd`; it launches `scripts/workbench.ps1`.
 
 It opens a Windows Forms control panel for common actions:
 
