@@ -120,38 +120,67 @@ function Start-InvoiceCommand {
     $Status.Text = "Started: $Title"
 }
 
-function Assert-TelegramDependency {
+function Get-MissingPythonModules {
+    param([string[]]$Modules)
+    $moduleCsv = $Modules -join ","
+    $code = "import importlib.util; names='$moduleCsv'.split(','); print(','.join(n for n in names if importlib.util.find_spec(n) is None))"
     try {
-        & $Python -c "import telegram; raise SystemExit(0)" *> $null
-        if ($LASTEXITCODE -eq 0) {
-            return $true
+        $output = (& $Python -c $code 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) {
+            return @($Modules)
         }
     } catch {
+        return @($Modules)
     }
+    if (-not $output) {
+        return @()
+    }
+    return @($output -split "," | Where-Object { $_ })
+}
+
+function Start-DependencyInstall {
+    param([string[]]$MissingModules)
+    $packageMap = @{
+        "telegram" = "python-telegram-bot>=22.0"
+        "cv2" = "opencv-python>=4.9.0"
+        "PIL" = "Pillow>=10.0.0"
+        "numpy" = "numpy>=1.24,<2.4"
+        "openpyxl" = "openpyxl>=3.1.0"
+    }
+    $packages = @($MissingModules | ForEach-Object { $packageMap[$_] } | Where-Object { $_ } | Select-Object -Unique)
+    $missingText = $MissingModules -join ", "
     $answer = [System.Windows.Forms.MessageBox]::Show(
-        "Telegram dependency is missing in this Python runtime.`n`nInstall python-telegram-bot now?",
-        "Telegram dependency missing",
+        "Required modules are missing from the Python used by Workbench:`n$missingText`n`nInstall them now?",
+        "Invoice runtime incomplete",
         "YesNo",
         "Question"
     )
     if ($answer -ne "Yes") {
-        $Status.Text = "Telegram dependency missing. Install python-telegram-bot."
+        $Status.Text = "Cannot start. Missing: $missingText"
         return $false
     }
-    $installCommand = "& " + (ConvertTo-CommandLiteral $Python) + " -m pip install `"python-telegram-bot>=22.0`"; if (`$LASTEXITCODE -eq 0) { Write-Host 'Telegram dependency installed. You can close this window.' } else { Write-Host 'Install failed. Keep this window open and check the error.' }"
-    $process = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-ExecutionPolicy", "Bypass", "-Command", $installCommand) -WindowStyle Normal -PassThru
-    $process.WaitForExit()
-    try {
-        & $Python -c "import telegram; raise SystemExit(0)" *> $null
-        if ($LASTEXITCODE -eq 0) {
-            $Status.Text = "Telegram dependency installed."
-            return $true
-        }
-    } catch {
-    }
-    [System.Windows.Forms.MessageBox]::Show("Telegram dependency install did not complete. Check the install window.", "Install failed", "OK", "Warning") | Out-Null
-    $Status.Text = "Telegram dependency install failed."
+    $pythonLiteral = ConvertTo-CommandLiteral $Python
+    $packageText = ($packages | ForEach-Object { ConvertTo-CommandLiteral $_ }) -join " "
+    $installCommand = "& $pythonLiteral -m pip install $packageText; if (`$LASTEXITCODE -eq 0) { Write-Host 'Invoice runtime dependencies installed.' -ForegroundColor Green; Start-Sleep -Seconds 3; exit 0 } else { Write-Host 'Install failed. Keep this window open and check the error.' -ForegroundColor Red }"
+    Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-ExecutionPolicy", "Bypass", "-Command", $installCommand) -WindowStyle Normal | Out-Null
+    $Status.Text = "Installing missing modules: $missingText. Click Start again after the install window closes."
     return $false
+}
+
+function Assert-TelegramDependency {
+    $missing = @(Get-MissingPythonModules -Modules @("telegram"))
+    if ($missing.Count -eq 0) {
+        return $true
+    }
+    return Start-DependencyInstall -MissingModules $missing
+}
+
+function Assert-ProcessingDependencies {
+    $missing = @(Get-MissingPythonModules -Modules @("telegram", "cv2", "PIL", "numpy", "openpyxl"))
+    if ($missing.Count -eq 0) {
+        return $true
+    }
+    return Start-DependencyInstall -MissingModules $missing
 }
 
 function Open-Path {
@@ -393,7 +422,7 @@ $AdvancedTab = New-WorkbenchTab "Advanced"
 
 Add-Section "Telegram bot" 20 20 $DailyTab
 Add-Button "Start / Restart Auto Scan" 20 55 {
-    if (Assert-TelegramDependency) {
+    if (Assert-ProcessingDependencies) {
         Start-InvoiceCommand -Title "Telegram bot auto scan" -InvoiceArgs @("telegram", "--process") -RestartExisting
     }
 } "Stops old invoice_system PIDs if any, then starts polling with auto scan." $DailyTab 235 "Primary"

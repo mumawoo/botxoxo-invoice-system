@@ -101,6 +101,7 @@ def _record_from_data(data: dict) -> InvoiceRecord:
         tips=_float(data.get("tips")),
         seller=seller,
         remarks=str(data.get("remarks") or "Codex Scan used"),
+        report_components=True,
     )
     _validate_record(record)
     if record.expense_amount <= 0 and record.total_amount > 0:

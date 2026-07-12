@@ -53,7 +53,10 @@ class ReimbursementExcelTests(unittest.TestCase):
                 expense_category="Food",
                 currency="USD",
                 total_amount=10,
+                vat_amount=1.6,
+                tips=2,
                 seller="Cafe",
+                report_components=True,
             )
 
             store.write_records([record])
@@ -62,15 +65,19 @@ class ReimbursementExcelTests(unittest.TestCase):
             try:
                 ws = wb[INVOICE_EXP_SHEET]
                 self.assertEqual(ws.cell(1, 2).value, "Manual status")
-                self.assertEqual(ws.cell(1, 12).value, "Trace ID")
-                self.assertEqual(ws.cell(1, 13).value, "System note")
-                self.assertEqual(ws.cell(1, 14).value, "Invoice link")
+                self.assertEqual(ws.cell(1, 12).value, "IVA/VAT MXN")
+                self.assertEqual(ws.cell(1, 13).value, "Tips MXN")
+                self.assertEqual(ws.cell(1, 14).value, "Trace ID")
+                self.assertEqual(ws.cell(1, 15).value, "System note")
+                self.assertEqual(ws.cell(1, 16).value, "Invoice link")
                 self.assertEqual(ws.cell(2, 4).value, 175)
                 self.assertEqual(ws.cell(2, 5).value, "餐饮")
                 self.assertEqual(ws.cell(2, 6).value, "USD")
                 self.assertEqual(ws.cell(2, 7).value, 10)
                 self.assertEqual(ws.cell(2, 8).value, 17.5)
                 self.assertEqual(ws.cell(2, 11).value, "Food")
+                self.assertEqual(ws.cell(2, 12).value, 28)
+                self.assertEqual(ws.cell(2, 13).value, 35)
                 rates = wb["exchange rate"]
                 self.assertEqual(rates.cell(1, 1).value, "日期")
                 self.assertEqual(rates.cell(1, 2).value, "USD")
@@ -98,6 +105,31 @@ class ReimbursementExcelTests(unittest.TestCase):
                 self.assertEqual(wb[INVOICE_EXP_SHEET].cell(3, 9).value, "Pemex")
                 self.assertNotIn(FOOD_EXP_SHEET, wb.sheetnames)
                 self.assertNotIn(OTHER_EXP_SHEET, wb.sheetnames)
+            finally:
+                wb.close()
+
+    def test_legacy_record_does_not_backfill_vat_or_tips_columns(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / REIMBURSEMENT_WORKBOOK_NAME
+            record = InvoiceRecord(
+                line_no=99,
+                invoice_date="2026-06-05",
+                expense_category="Food",
+                total_amount=331.10,
+                vat_amount=16,
+                tips=30.10,
+                seller="Legacy Cafe",
+                report_components=False,
+            )
+
+            ReimbursementWorkbook(path).write_records([record])
+
+            wb = load_workbook(path, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                headers = {cell.value: cell.column for cell in ws[1]}
+                self.assertIsNone(ws.cell(2, headers["IVA/VAT MXN"]).value)
+                self.assertIsNone(ws.cell(2, headers["Tips MXN"]).value)
             finally:
                 wb.close()
 
@@ -355,7 +387,17 @@ class ReimbursementExcelTests(unittest.TestCase):
                 crop.write_bytes(b"jpg")
             ReimbursementWorkbook(path).write_records(
                 [
-                    InvoiceRecord(line_no=1, invoice_date="2026-06-12", expense_category="Food", total_amount=100, seller="Cafe", crop_image=str(crop1)),
+                    InvoiceRecord(
+                        line_no=1,
+                        invoice_date="2026-06-12",
+                        expense_category="Food",
+                        total_amount=100,
+                        vat_amount=16,
+                        tips=10,
+                        seller="Cafe",
+                        crop_image=str(crop1),
+                        report_components=True,
+                    ),
                     InvoiceRecord(line_no=2, invoice_date="2026-06-13", expense_category="Gas", total_amount=200, seller="Pemex", crop_image=str(crop2)),
                     InvoiceRecord(line_no=3, invoice_date="2026-06-14", expense_category="Other", total_amount=50, seller="Store", crop_image=str(crop3)),
                 ]
@@ -385,6 +427,8 @@ class ReimbursementExcelTests(unittest.TestCase):
                 food_headers = {checked[FOOD_EXP_SHEET].cell(1, col).value: col for col in range(1, checked[FOOD_EXP_SHEET].max_column + 1)}
                 other_headers = {checked[OTHER_EXP_SHEET].cell(1, col).value: col for col in range(1, checked[OTHER_EXP_SHEET].max_column + 1)}
                 self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, food_headers["Merchant"]).value, "Cafe")
+                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, food_headers["IVA/VAT MXN"]).value, 16)
+                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, food_headers["Tips MXN"]).value, 10)
                 self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, food_headers["Trace ID"]).value, "001")
                 self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, other_headers["Merchant"]).value, "Store")
                 self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, other_headers["Trace ID"]).value, "003")

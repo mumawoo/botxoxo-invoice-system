@@ -27,8 +27,14 @@ class OpenCVInvoiceSplitter:
     def split(self, image_path: Path) -> list[CropResult]:
         try:
             return self._split_with_opencv(image_path)
-        except Exception:
-            return [self._copy_original(image_path, 1)]
+        except ModuleNotFoundError as exc:
+            missing = str(getattr(exc, "name", "") or exc)
+            raise RuntimeError(
+                f"OpenCV invoice splitting is unavailable ({missing}). "
+                "Install opencv-python and numpy in the Python runtime used by the bot."
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(f"OpenCV invoice splitting failed for {image_path.name}: {exc}") from exc
 
     def _split_with_opencv(self, image_path: Path) -> list[CropResult]:
         import cv2

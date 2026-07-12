@@ -22,6 +22,16 @@ from invoice_system.image_splitter import (
 
 
 class ImageSplitterTests(unittest.TestCase):
+    def test_splitter_does_not_silently_copy_original_when_opencv_is_missing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            splitter = OpenCVInvoiceSplitter(Path(temp) / "crops")
+            missing = ModuleNotFoundError("No module named 'cv2'")
+            missing.name = "cv2"
+
+            with patch.object(splitter, "_split_with_opencv", side_effect=missing):
+                with self.assertRaisesRegex(RuntimeError, "OpenCV invoice splitting is unavailable"):
+                    splitter.split(Path("photo.jpg"))
+
     def test_iter_images_finds_supported_files_recursively(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -38,6 +38,8 @@ GROUP_ARCHIVE_DIR = "group_archive"
 MANUAL_STATUS_HEADER = "Manual status"
 TRACE_ID_HEADER = "Trace ID"
 SYSTEM_NOTE_HEADER = "System note"
+VAT_MXN_HEADER = "IVA/VAT MXN"
+TIPS_MXN_HEADER = "Tips MXN"
 
 REIMBURSEMENT_HEADERS = [
     "No.",
@@ -51,6 +53,8 @@ REIMBURSEMENT_HEADERS = [
     "Merchant",
     "Detail",
     "Accounting Category",
+    VAT_MXN_HEADER,
+    TIPS_MXN_HEADER,
     TRACE_ID_HEADER,
     SYSTEM_NOTE_HEADER,
     "Invoice link",
@@ -83,6 +87,8 @@ HEADER_ALIASES = {
     "Invoice link": {"invoice link", "link", "crop", "final crop", "\u56fe\u7247", "\u56fe\u7247\u94fe\u63a5"},
     "Date": {"date", "invoice date", "\u65e5\u671f"},
     "MXN Amount": {"mxn amount", "amount mxn", "\u62a5\u9500\u91d1\u989d", "\u6bd4\u7d22\u91d1\u989d"},
+    VAT_MXN_HEADER: {"iva/vat mxn", "iva vat mxn", "vat mxn", "iva mxn", "\u589e\u503c\u7a0e mxn"},
+    TIPS_MXN_HEADER: {"tips mxn", "tip mxn", "propina mxn", "\u5c0f\u8d39 mxn"},
     "Type": {"type", "\u7c7b\u578b", "\u8d39\u7528\u7c7b\u578b"},
     "\u539f\u5e01\u79cd": {"\u539f\u5e01\u79cd", "original currency", "currency"},
     "\u539f\u91d1\u989d": {"\u539f\u91d1\u989d", "original amount"},
@@ -892,6 +898,8 @@ def _manual_values_from_checked(output_dir: Path, row: _CheckedFinanceRow, basel
         values_by_header.get("Merchant"),
         values_by_header.get("Detail"),
         category,
+        values_by_header.get(VAT_MXN_HEADER),
+        values_by_header.get(TIPS_MXN_HEADER),
         trace_id,
         "",
         f"{CROPS_DIR}/{final_name}",
@@ -2030,6 +2038,9 @@ def _reimbursement_value_map(record: InvoiceRecord, rates: list[ExchangeRate]) -
     rate_date = _record_date(record) or date.today()
     rate = _best_rate_for_date(rates, rate_date)
     mxn_amount, fx_multiplier = _mxn_amount(original_amount, original_currency, rate)
+    report_components = bool(getattr(record, "report_components", False))
+    vat_mxn = _component_amount_mxn(record.vat_amount, original_currency, fx_multiplier) if report_components else None
+    tips_mxn = _component_amount_mxn(record.tips, original_currency, fx_multiplier) if report_components else None
     category_en = normalize_expense_category(record.expense_category, f"{record.seller} {record.contents}")
     return {
         "No.": _crop_no_from_link(record.crop_image) or record.line_no,
@@ -2045,8 +2056,19 @@ def _reimbursement_value_map(record: InvoiceRecord, rates: list[ExchangeRate]) -
         "Merchant": record.seller,
         "Detail": record.contents,
         "Accounting Category": category_en,
+        VAT_MXN_HEADER: vat_mxn,
+        TIPS_MXN_HEADER: tips_mxn,
         SYSTEM_NOTE_HEADER: record.remarks,
     }
+
+
+def _component_amount_mxn(amount: float, currency: str, fx_multiplier: float | None) -> float | None:
+    value = round(float(amount or 0), 2)
+    if currency == "MXN":
+        return value
+    if fx_multiplier is None:
+        return None
+    return round(value * fx_multiplier, 2)
 
 
 def _mxn_amount(amount: float, currency: str, rate: ExchangeRate | None) -> tuple[float | None, float | None]:
@@ -2072,9 +2094,12 @@ def _record_from_reimbursement_row(values: list[object]) -> InvoiceRecord:
         contents=str(values[9] or ""),
         currency=currency,
         total_amount=round(mxn_amount if currency == "MXN" or original_amount <= 0 else mxn_amount, 2),
+        vat_amount=_to_float(_row_value(values, VAT_MXN_HEADER)),
+        tips=_to_float(_row_value(values, TIPS_MXN_HEADER)),
         seller=str(values[8] or "Unknown"),
         remarks=str(_row_value(values, SYSTEM_NOTE_HEADER) or ""),
         crop_image=str(_row_value(values, "Invoice link") or ""),
+        report_components=any(_row_value(values, header) not in (None, "") for header in (VAT_MXN_HEADER, TIPS_MXN_HEADER)),
     )
     record.original_currency = currency
     record.original_amount = round(original_amount if original_amount > 0 else mxn_amount, 2)
@@ -2240,6 +2265,10 @@ def _format_row(ws, row: int, columns: dict[str, int]) -> None:
         ws.cell(row, columns["Date"]).number_format = "yyyy-mm-dd"
     if columns.get("MXN Amount"):
         ws.cell(row, columns["MXN Amount"]).number_format = "#,##0.00"
+    if columns.get(VAT_MXN_HEADER):
+        ws.cell(row, columns[VAT_MXN_HEADER]).number_format = "#,##0.00"
+    if columns.get(TIPS_MXN_HEADER):
+        ws.cell(row, columns[TIPS_MXN_HEADER]).number_format = "#,##0.00"
     if columns.get("\u539f\u91d1\u989d"):
         ws.cell(row, columns["\u539f\u91d1\u989d"]).number_format = "#,##0.00"
     if columns.get("\u6c47\u7387"):

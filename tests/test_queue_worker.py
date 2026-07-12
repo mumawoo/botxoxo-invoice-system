@@ -25,6 +25,7 @@ from invoice_system.queue_worker import (
     retry_failed,
     rollback_last_photo,
     save_queue_state,
+    telegram_photo_quality,
     telegram_user_day_dir,
     telegram_user_output_dir,
     telegram_user_queue_path,
@@ -35,6 +36,11 @@ from invoice_system.reimbursement_excel import load_reimbursement_records
 
 
 class QueueWorkerTests(unittest.TestCase):
+    def test_telegram_photo_quality_classifies_sd_hd_and_unknown(self):
+        self.assertEqual(telegram_photo_quality(960, 1280), "sd")
+        self.assertEqual(telegram_photo_quality(1920, 2560), "hd")
+        self.assertEqual(telegram_photo_quality(0, 0), "unknown")
+
     def test_enqueue_photo_writes_per_user_queue(self):
         with tempfile.TemporaryDirectory() as temp:
             settings = _settings(Path(temp))
@@ -47,6 +53,37 @@ class QueueWorkerTests(unittest.TestCase):
             self.assertEqual(summary.pending, 1)
             self.assertTrue(telegram_user_queue_path(settings, 123).exists())
             self.assertFalse(telegram_user_queue_path(settings, 456).exists())
+
+    def test_enqueue_photo_persists_telegram_quality_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = _settings(Path(temp))
+            photo = telegram_user_day_dir(settings, 123) / "photo.jpg"
+            photo.parent.mkdir(parents=True)
+            photo.write_bytes(b"jpg")
+
+            enqueue_photo(
+                settings,
+                123,
+                photo,
+                image_width=960,
+                image_height=1280,
+                file_size=321,
+                upload_quality="sd",
+            )
+
+            item = load_queue_state(telegram_user_queue_path(settings, 123)).items[0]
+            self.assertEqual((item.image_width, item.image_height, item.file_size), (960, 1280, 321))
+            self.assertEqual(item.upload_quality, "sd")
+
+    def test_old_queue_item_without_quality_fields_loads_as_unknown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "queue_state.json"
+            path.write_text(json.dumps({"items": [{"path": "old.jpg", "status": "done"}]}), encoding="utf-8")
+
+            item = load_queue_state(path).items[0]
+
+            self.assertEqual(item.upload_quality, "unknown")
+            self.assertEqual(item.detected_receipt_count, 0)
 
     def test_discover_and_enqueue_scans_user_root_only(self):
         with tempfile.TemporaryDirectory() as temp:

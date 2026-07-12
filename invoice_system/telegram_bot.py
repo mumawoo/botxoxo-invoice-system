@@ -32,6 +32,7 @@ from .queue_worker import (
     rollback_last_photo,
     start_background_worker,
     summarize_queue,
+    telegram_photo_quality,
     telegram_user_day_dir,
     telegram_user_output_dir,
     telegram_user_queue_path,
@@ -132,6 +133,22 @@ def processing_failure_message(path: Path, exc: Exception, lang: str = LANG_EN) 
     return f"Saved photo\nProcessing failed: {detail}"
 
 
+def _photo_quality_warning(item: QueueItem, lang: str = LANG_EN) -> str:
+    if str(item.upload_quality or "").casefold() != "sd" or int(item.detected_receipt_count or 0) < 4:
+        return ""
+    dimensions = f"{int(item.image_width or 0)}×{int(item.image_height or 0)}"
+    count = int(item.detected_receipt_count or 0)
+    if is_zh(lang):
+        return (
+            f"清晰度提醒：本图为 {dimensions}，共检测到 {count} 张票。"
+            "下次请在发送前点 SD→HD。本次已继续扫描，请用 /crops 抽查。"
+        )
+    return (
+        f"Quality reminder: this photo is {dimensions} with {count} detected receipts. "
+        "Next time tap SD→HD before sending. This scan continued; use /crops to review."
+    )
+
+
 def scan_completion_message(settings: Settings, user_id: int, item: QueueItem, records: list[InvoiceRecord], lang: str = LANG_EN) -> str:
     if item.status == FAILED_RETRYABLE:
         if is_zh(lang):
@@ -163,6 +180,9 @@ def scan_completion_message(settings: Settings, user_id: int, item: QueueItem, r
     if original_totals:
         lines.append("原币种合计：" if is_zh(lang) else "Original totals:")
         lines.extend(_format_currency_lines(original_totals))
+    quality_warning = _photo_quality_warning(item, lang)
+    if quality_warning:
+        lines.extend(["", quality_warning])
     if is_zh(lang):
         lines.extend(["", "今天合计", f"行数：{today.record_count}", f"MXN 总额：{today.total_amount:.2f}"])
         lines.extend(_format_category_block(today.category_totals, lang))
@@ -206,11 +226,16 @@ def telegram_polling_ready(settings: Settings) -> bool:
 
 
 def telegram_config_ready(settings: Settings) -> bool:
-    return telegram_polling_ready(settings) and bool(settings.telegram_allowed_user_ids)
+    return telegram_polling_ready(settings) and bool(settings.telegram_allowed_user_ids) and not missing_photo_processing_packages()
 
 
 def telegram_package_ready() -> bool:
     return importlib.util.find_spec("telegram") is not None and importlib.util.find_spec("telegram.ext") is not None
+
+
+def missing_photo_processing_packages() -> tuple[str, ...]:
+    modules = ("cv2", "PIL", "numpy", "openpyxl")
+    return tuple(name for name in modules if importlib.util.find_spec(name) is None)
 
 
 def telegram_start_message(settings: Settings, lang: str = LANG_EN) -> str:
@@ -228,6 +253,12 @@ def telegram_help_message(lang: str = LANG_EN) -> str:
     lines = [title, *[f"/{command} - {description}" for command, description in telegram_command_menu(lang)]]
     lines.extend(
         [
+            "",
+            (
+                "高清拍照：回形针/相机 → 拍照 → 预览页点 SD → HD → 发送。"
+                if is_zh(lang)
+                else "HD photo: paperclip/camera → take photo → tap SD in preview → HD → send."
+            ),
             "",
             "Available type/category values:",
             ", ".join(EXPENSE_CATEGORIES),
@@ -945,6 +976,7 @@ def _display_value(value: object) -> str:
 
 def format_telegram_config(settings: Settings, auto_process: bool | None = None) -> str:
     allowed_count = len(settings.telegram_allowed_user_ids)
+    missing_processing = missing_photo_processing_packages()
     lines = [
         "Telegram bot config:",
         f"Bot token: {'configured' if settings.telegram_bot_token else 'missing'}",
@@ -955,6 +987,8 @@ def format_telegram_config(settings: Settings, auto_process: bool | None = None)
         f"Company profile: {company_profile_status(settings.company_profile, settings.root)}",
         f"Inbound photo folder: {settings.inbound_dir / 'telegram' / '<telegram_user_id>' / 'YYYY-MM-DD'}",
         f"Qwen OCR: {'enabled' if settings.qwen_api_key else 'disabled'}",
+        f"OpenCV splitter: {'READY' if 'cv2' not in missing_processing else 'MISSING'}",
+        f"Photo processing packages: {'READY' if not missing_processing else 'MISSING ' + ', '.join(missing_processing)}",
         "OpenAI fallback: removed",
         f"Polling startup: {'READY' if telegram_polling_ready(settings) else 'NOT READY'}",
         f"Photo ingestion: {'READY' if telegram_config_ready(settings) else 'NOT READY'}",
@@ -963,6 +997,8 @@ def format_telegram_config(settings: Settings, auto_process: bool | None = None)
         lines.append("Set TELEGRAM_BOT_TOKEN in .env before starting polling.")
     if not telegram_package_ready():
         lines.append('Install python-telegram-bot with: python -m pip install "python-telegram-bot>=22.0"')
+    if missing_processing:
+        lines.append('Install photo processing packages in this Python runtime: python -m pip install "opencv-python>=4.9.0" "Pillow>=10.0.0" "numpy>=1.24,<2.4" "openpyxl>=3.1.0"')
     if not settings.telegram_allowed_user_ids:
         lines.append("Set TELEGRAM_ALLOWED_USER_IDS before sending photos; empty allow-list rejects all photos.")
     if settings.telegram_bot_token and not settings.telegram_allowed_user_ids:
@@ -977,6 +1013,12 @@ def format_telegram_config(settings: Settings, auto_process: bool | None = None)
 def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> None:
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    missing_processing = missing_photo_processing_packages()
+    if resolve_auto_process(settings, auto_process) and missing_processing:
+        raise RuntimeError(
+            "Auto scan cannot start because photo processing packages are missing: "
+            + ", ".join(missing_processing)
+        )
     lock_path = _acquire_telegram_instance_lock(settings)
     try:
         from telegram import BotCommand, MenuButtonCommands, Update
@@ -1233,7 +1275,16 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
         target = day_dir / telegram_photo_filename(now, photo_size.file_id, photo_size.file_unique_id)
         await telegram_file.download_to_drive(custom_path=Path(target))
         grouped_upload = mark_source_for_group_if_armed(telegram_user_output_dir(settings, user.id), target)
-        enqueue_photo(settings, user.id, target, now)
+        enqueue_photo(
+            settings,
+            user.id,
+            target,
+            now,
+            image_width=int(getattr(photo_size, "width", 0) or 0),
+            image_height=int(getattr(photo_size, "height", 0) or 0),
+            file_size=int(target.stat().st_size),
+            upload_quality=telegram_photo_quality(getattr(photo_size, "width", 0), getattr(photo_size, "height", 0)),
+        )
 
         should_process = resolve_auto_process(settings, auto_process)
         if should_process:
@@ -1274,7 +1325,14 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
         target = day_dir / telegram_image_document_filename(now, document.file_id, document.file_name, getattr(document, "file_unique_id", None))
         await telegram_file.download_to_drive(custom_path=Path(target))
         grouped_upload = mark_source_for_group_if_armed(telegram_user_output_dir(settings, user.id), target)
-        enqueue_photo(settings, user.id, target, now)
+        enqueue_photo(
+            settings,
+            user.id,
+            target,
+            now,
+            file_size=int(target.stat().st_size),
+            upload_quality="original",
+        )
 
         should_process = resolve_auto_process(settings, auto_process)
         if should_process:

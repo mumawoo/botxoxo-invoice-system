@@ -13,6 +13,13 @@ from .config import Settings
 from .models import OCRResult
 
 
+QWEN_DEFAULT_MAX_EDGE = 1600
+QWEN_LONG_RECEIPT_MAX_EDGE = 2000
+QWEN_LONG_RECEIPT_ASPECT_RATIO = 2.2
+QWEN_IMAGE_MAX_BYTES = 900 * 1024
+QWEN_JPEG_QUALITIES = (88, 82, 76, 70)
+
+
 class QwenScanRecognizer:
     engine = "qwen_scan"
 
@@ -88,9 +95,29 @@ def _extract_message_content(data: object) -> str:
 def _qwen_image_url(path: Path) -> str:
     import base64
 
+    return f"data:image/jpeg;base64,{base64.b64encode(_qwen_image_bytes(path)).decode('ascii')}"
+
+
+def _qwen_image_bytes(path: Path) -> bytes:
     with Image.open(path) as image:
         image = image.convert("RGB")
-        image.thumbnail((1000, 1000))
-        buffer = BytesIO()
-        image.save(buffer, format="JPEG", quality=85, optimize=True)
-    return f"data:image/jpeg;base64,{base64.b64encode(buffer.getvalue()).decode('ascii')}"
+        width, height = image.size
+        short_edge = max(min(width, height), 1)
+        aspect_ratio = max(width, height) / short_edge
+        max_edge = QWEN_LONG_RECEIPT_MAX_EDGE if aspect_ratio >= QWEN_LONG_RECEIPT_ASPECT_RATIO else QWEN_DEFAULT_MAX_EDGE
+        image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+
+        while True:
+            encoded = b""
+            for quality in QWEN_JPEG_QUALITIES:
+                buffer = BytesIO()
+                image.save(buffer, format="JPEG", quality=quality, optimize=True)
+                encoded = buffer.getvalue()
+                if len(encoded) <= QWEN_IMAGE_MAX_BYTES:
+                    return encoded
+            longest = max(image.size)
+            if longest <= 640:
+                return encoded
+            scale = max(640 / longest, 0.85)
+            resized = (max(int(image.width * scale), 1), max(int(image.height * scale), 1))
+            image = image.resize(resized, Image.Resampling.LANCZOS)

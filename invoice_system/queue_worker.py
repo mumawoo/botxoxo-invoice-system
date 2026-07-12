@@ -45,6 +45,11 @@ class QueueItem:
     total_amount: float = 0.0
     category_totals: dict[str, float] | None = None
     workbook_path: str = ""
+    image_width: int = 0
+    image_height: int = 0
+    file_size: int = 0
+    upload_quality: str = "unknown"
+    detected_receipt_count: int = 0
 
 
 @dataclass
@@ -159,13 +164,33 @@ def reset_active_user_workspace(settings: Settings, user_id: int) -> ResetSummar
     return ResetSummary(user_id, archive_dir, moved, True)
 
 
-def enqueue_photo(settings: Settings, user_id: int, photo_path: Path, received_at: datetime | None = None) -> QueueSummary:
+def enqueue_photo(
+    settings: Settings,
+    user_id: int,
+    photo_path: Path,
+    received_at: datetime | None = None,
+    *,
+    image_width: int = 0,
+    image_height: int = 0,
+    file_size: int = 0,
+    upload_quality: str = "unknown",
+) -> QueueSummary:
     queue_path = telegram_user_queue_path(settings, user_id)
     state = load_queue_state(queue_path)
     key = _path_key(photo_path)
     if not any(_path_key(Path(item.path)) == key for item in state.items):
         now = _timestamp(received_at)
-        state.items.append(QueueItem(path=str(photo_path), received_at=now, updated_at=now))
+        state.items.append(
+            QueueItem(
+                path=str(photo_path),
+                received_at=now,
+                updated_at=now,
+                image_width=max(int(image_width or 0), 0),
+                image_height=max(int(image_height or 0), 0),
+                file_size=max(int(file_size or 0), 0),
+                upload_quality=normalize_upload_quality(upload_quality),
+            )
+        )
         save_queue_state(queue_path, state)
     return summarize_queue(settings, user_id)
 
@@ -311,6 +336,7 @@ def prepare_last_photo_rescan(settings: Settings, user_id: int) -> RescanSummary
     item.total_amount = 0.0
     item.category_totals = {}
     item.workbook_path = ""
+    item.detected_receipt_count = 0
     item.updated_at = _timestamp()
     state.current_photo = ""
     state.worker_status = "stopped"
@@ -376,6 +402,7 @@ def process_user_queue_once(
                 item.total_amount = round(sum(record.total_amount for record in new_records), 2)
                 item.category_totals = _category_totals(new_records)
                 item.workbook_path = str(summary.workbook_path)
+                item.detected_receipt_count = _detected_receipt_count(output_dir, Path(item.path))
                 if after <= before and before > 0:
                     item.error = "Already completed in processing checkpoint"
             except Exception as exc:
@@ -438,6 +465,18 @@ def summarize_queue(settings: Settings, user_id: int) -> QueueSummary:
         queue_path=queue_path,
         last_error=state.last_error,
     )
+
+
+def telegram_photo_quality(width: int, height: int) -> str:
+    longest_edge = max(int(width or 0), int(height or 0))
+    if longest_edge <= 0:
+        return "unknown"
+    return "sd" if longest_edge <= 1280 else "hd"
+
+
+def normalize_upload_quality(value: object) -> str:
+    normalized = str(value or "unknown").strip().casefold()
+    return normalized if normalized in {"sd", "hd", "original"} else "unknown"
 
 
 def format_status(summary: QueueSummary) -> str:
@@ -739,6 +778,30 @@ def _completed_source_count(output_dir: Path) -> int:
         return len(data.get("completed_sources", []))
     except Exception:
         return 0
+
+
+def _detected_receipt_count(output_dir: Path, source_path: Path) -> int:
+    state_path = output_dir / "processing_state.json"
+    if not state_path.exists():
+        return 0
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    source_key = _path_key(source_path)
+    for item in reversed(data.get("source_qas", [])):
+        if not isinstance(item, dict):
+            continue
+        if _path_key(Path(str(item.get("source_image") or ""))) != source_key:
+            continue
+        counts = [int(item.get("opencv_crop_count") or 0)]
+        if item.get("ai_visual_count") not in (None, ""):
+            try:
+                counts.append(int(item["ai_visual_count"]))
+            except (TypeError, ValueError):
+                pass
+        return max(counts, default=0)
+    return 0
 
 
 def _workbook_records_for_source(output_dir: Path, source_path: Path, workbook_records: list[InvoiceRecord]) -> list[InvoiceRecord]:

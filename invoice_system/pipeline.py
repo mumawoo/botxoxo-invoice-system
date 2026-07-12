@@ -473,9 +473,11 @@ def _apply_qwen_orientation(image_path: Path, result: OCRResult) -> str:
 
         with Image.open(image_path) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
-            image = image.rotate(rotation, expand=True)
+            # Pillow uses positive angles for counterclockwise rotation. Qwen,
+            # Tesseract, and OpenCV all report the clockwise correction needed.
+            image = image.rotate(-rotation, expand=True)
             image.save(image_path, quality=98)
-        return f"qwen rotated crop {rotation}deg {confidence:.2f}"
+        return f"qwen rotated crop {rotation}deg clockwise {confidence:.2f}"
     except Exception as exc:
         result.error = f"{result.error}; orientation rotate failed: {exc}" if result.error else f"orientation rotate failed: {exc}"
         return f"qwen orientation rotate failed {rotation}deg"

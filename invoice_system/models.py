@@ -77,6 +77,7 @@ class InvoiceRecord:
     source_image: str = ""
     crop_image: str = ""
     supporting_crop_images: list[str] = field(default_factory=list)
+    report_components: bool = False
 
     def to_excel_row(self) -> list[object]:
         return [

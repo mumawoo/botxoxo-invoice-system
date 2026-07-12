@@ -98,7 +98,7 @@ class PipelineHelperTests(unittest.TestCase):
                 self.assertEqual(rotated.getpixel((11, 7)), (255, 0, 0))
             self.assertIn("rotated crop 180deg", note)
 
-    def test_apply_qwen_orientation_uses_qwen_counterclockwise_90_convention(self):
+    def test_apply_qwen_orientation_uses_clockwise_90_convention(self):
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as temp:
@@ -112,8 +112,41 @@ class PipelineHelperTests(unittest.TestCase):
 
             with Image.open(image_path) as rotated:
                 self.assertEqual(rotated.size, (8, 12))
+                self.assertEqual(rotated.getpixel((7, 0)), (255, 0, 0))
+            self.assertIn("rotated crop 90deg clockwise", note)
+
+    def test_apply_qwen_orientation_uses_clockwise_270_convention(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "crop.png"
+            image = Image.new("RGB", (12, 8), "white")
+            image.putpixel((0, 0), (255, 0, 0))
+            image.save(image_path)
+            result = OCRResult("qwen_scan", rotate_degrees=270, orientation_confidence=0.98)
+
+            note = _apply_qwen_orientation(image_path, result)
+
+            with Image.open(image_path) as rotated:
+                self.assertEqual(rotated.size, (8, 12))
                 self.assertEqual(rotated.getpixel((0, 11)), (255, 0, 0))
-            self.assertIn("rotated crop 90deg", note)
+            self.assertIn("rotated crop 270deg clockwise", note)
+
+    def test_apply_qwen_orientation_does_not_rotate_low_confidence_crop(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "crop.png"
+            image = Image.new("RGB", (12, 8), "white")
+            image.putpixel((0, 0), (255, 0, 0))
+            image.save(image_path)
+            before = image_path.read_bytes()
+            result = OCRResult("qwen_scan", rotate_degrees=90, orientation_confidence=0.50)
+
+            note = _apply_qwen_orientation(image_path, result)
+
+            self.assertEqual(image_path.read_bytes(), before)
+            self.assertIn("orientation uncertain 90deg", note)
 
     def test_copy_final_crops_removes_stale_generated_files(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -260,7 +293,8 @@ class PipelineHelperTests(unittest.TestCase):
                 self.assertEqual(ws.max_row, 2)
                 self.assertEqual(ws.cell(2, 1).value, 1)
                 self.assertEqual(ws.cell(2, 9).value, "Unknown")
-                self.assertIn("needs human review", ws.cell(2, 13).value)
+                headers = {cell.value: cell.column for cell in ws[1]}
+                self.assertIn("needs human review", ws.cell(2, headers["System note"]).value)
             finally:
                 wb.close()
 

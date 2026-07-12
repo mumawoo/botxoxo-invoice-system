@@ -57,6 +57,9 @@ class WindowsScriptTests(unittest.TestCase):
         self.assertIn("Start / Restart Auto Scan", text)
         self.assertIn("Confirm-AndStopExistingInvoiceProcesses", text)
         self.assertIn("-RestartExisting", text)
+        self.assertIn("Assert-ProcessingDependencies", text)
+        self.assertIn('"telegram", "cv2", "PIL", "numpy", "openpyxl"', text)
+        self.assertNotIn("WaitForExit", text)
         self.assertIn("-m invoice_system", text)
         self.assertNotIn("Open Review Crops", text)
 
