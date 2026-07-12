@@ -15,7 +15,7 @@ from .expense_categories import normalize_expense_category
 from .image_splitter import OpenCVInvoiceSplitter, iter_images
 from .models import CropResult, InvoiceRecord, OCRAuditRow, OCRResult, PipelineSummary, SourceQARecord
 from .pairing import pair_invoice_payment_slips
-from .quality import is_noise_record
+from .quality import should_delete_failed_crop
 from .qwen_scan import QwenScanRecognizer
 from .reimbursement_excel import (
     ReimbursementWorkbook,
@@ -94,7 +94,12 @@ class InvoicePipeline:
                 record.crop_image = str(crop.crop_path)
                 codex = resolved.codex
                 decision = resolved.reason
-                if is_noise_record(record):
+                if should_delete_failed_crop(
+                    record,
+                    crop.crop_path,
+                    ocr_text=codex.text if codex else "",
+                    ocr_error=codex.error if codex else "",
+                ):
                     decision = f"{decision}; noise filtered; crop deleted"
                     _delete_file(crop.crop_path)
                 else:

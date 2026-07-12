@@ -234,6 +234,36 @@ class PipelineHelperTests(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_failed_qwen_receipt_crop_is_kept_for_human_review(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            sample = root / "payment.jpg"
+            _write_receipt_like_image(sample)
+            settings = Settings(
+                root=root,
+                inbound_dir=root / "data" / "inbound",
+                trial_dir=root / "data" / "trial",
+                output_dir=root / "data" / "output",
+                baseline_dir=root / "data" / "baseline",
+            )
+            output = root / "out"
+
+            summary = InvoicePipeline(settings=settings, trial=True, output_dir=output, resolver=FailedQwenReceiptResolver()).process_path(sample)
+
+            self.assertEqual(summary.crops, 1)
+            self.assertEqual(summary.records_written, 1)
+            crops = list((output / "crops").glob("*.jpg"))
+            self.assertEqual(len(crops), 1)
+            wb = load_workbook(summary.workbook_path, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                self.assertEqual(ws.max_row, 2)
+                self.assertEqual(ws.cell(2, 1).value, 1)
+                self.assertEqual(ws.cell(2, 9).value, "Unknown")
+                self.assertIn("needs human review", ws.cell(2, 13).value)
+            finally:
+                wb.close()
+
     def test_resume_skips_completed_source_after_crash(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -499,6 +529,33 @@ class NoiseResolver:
         record = InvoiceRecord(seller="Unknown", total_amount=0)
         result = OCRResult("qwen_scan", [], record, 1.0)
         return ResolvedScan(record, result, result, result, True, "qwen scan only")
+
+
+class FailedQwenReceiptResolver:
+    def scan(self, image_path: Path) -> ResolvedScan:
+        record = InvoiceRecord(seller="Unknown", total_amount=0, remarks="Qwen Scan failed: total_amount; needs human review")
+        result = OCRResult(
+            "qwen_scan",
+            [OCRTextLine('{"seller":"Flap","total_amount":0,"remarks":"Importe visible but not parsed"}', 1.0)],
+            None,
+            0.0,
+            "Qwen Scan JSON failed validation: total_amount",
+        )
+        empty = OCRResult("local_ocr_disabled")
+        return ResolvedScan(record, empty, empty, result, False, "qwen scan failed")
+
+
+def _write_receipt_like_image(path: Path) -> None:
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (1200, 1600), "white")
+    draw = ImageDraw.Draw(image)
+    draw.text((120, 140), "COMISION FEDERAL DE ELECTRICIDAD", fill="black")
+    draw.text((120, 260), "COMPROBANTE DE PAGO POR INTERNET", fill="black")
+    draw.text((120, 380), "Fecha de pago: 11/07/2026", fill="black")
+    draw.text((120, 500), "Importe: $58.00", fill="black")
+    draw.text((120, 620), "CINCUENTA Y OCHO PESOS 00/100 MXP", fill="black")
+    image.save(path)
 
 
 if __name__ == "__main__":

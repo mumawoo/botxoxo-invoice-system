@@ -18,6 +18,7 @@ expense_amount, vat_amount, sales_tax, tips, seller, remarks, rotate_degrees,
 orientation_confidence.
 seller, currency, and total_amount are required. Use ISO date YYYY-MM-DD for invoice_date when visible; otherwise return an empty invoice_date string so nearby receipts can supply the date. Also return raw_date exactly as printed on the receipt, such as "10/05/2026". For ambiguous numeric dates, use DD/MM/YYYY for Mexico, Spanish-language, or MXN receipts. Use MM/DD/YYYY only when the receipt is clearly US/English/USD.
 Detect currency from the receipt: use USD for US dollar receipts and MXN for Mexican peso receipts. A "$" symbol alone is ambiguous, so infer from merchant country, tax labels, address, and context before defaulting to MXN. Use 0 for unknown optional amounts.
+Payment confirmations and utility bills are valid reimbursement documents. For Multipagos, CFE/Comision Federal de Electricidad, internet payment receipts, or card payment confirmations, use the beneficiary/service provider as seller when visible, use Utilities when it is an electricity/water/gas/utility payment, and extract total_amount from labels such as Importe, Total, Monto, Cantidad, or amount-in-words like "CINCUENTA Y OCHO PESOS 00/100 MXP". Do not treat a Flap/BBVA branding strip as the seller when the document body names the service provider.
 expense_category must be exactly one of: {", ".join(EXPENSE_CATEGORIES)}.
 Also judge the crop orientation while reading it. rotate_degrees must be one of
 0, 90, 180, or 270 and means how much the saved crop image should be rotated
