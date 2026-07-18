@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import json
 from pathlib import Path
+from unittest.mock import patch
 
 from openpyxl import load_workbook
 
@@ -14,6 +15,8 @@ from invoice_system.pipeline import (
     _copy_final_crops,
     _fill_missing_dates_from_neighbors,
     _final_crop_name,
+    _source_qa_record,
+    QwenOnlyResolver,
 )
 from invoice_system.reimbursement_excel import CHECKED_WORKBOOK_NAME, INVOICE_EXP_SHEET, reimbursement_workbook_path
 from invoice_system.sample_data import create_synthetic_multi_receipt
@@ -98,7 +101,7 @@ class PipelineHelperTests(unittest.TestCase):
                 self.assertEqual(rotated.getpixel((11, 7)), (255, 0, 0))
             self.assertIn("rotated crop 180deg", note)
 
-    def test_apply_qwen_orientation_uses_qwen_counterclockwise_90_convention(self):
+    def test_apply_qwen_orientation_uses_clockwise_90_convention(self):
         from PIL import Image
 
         with tempfile.TemporaryDirectory() as temp:
@@ -112,8 +115,41 @@ class PipelineHelperTests(unittest.TestCase):
 
             with Image.open(image_path) as rotated:
                 self.assertEqual(rotated.size, (8, 12))
+                self.assertEqual(rotated.getpixel((7, 0)), (255, 0, 0))
+            self.assertIn("rotated crop 90deg clockwise", note)
+
+    def test_apply_qwen_orientation_uses_clockwise_270_convention(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "crop.png"
+            image = Image.new("RGB", (12, 8), "white")
+            image.putpixel((0, 0), (255, 0, 0))
+            image.save(image_path)
+            result = OCRResult("qwen_scan", rotate_degrees=270, orientation_confidence=0.98)
+
+            note = _apply_qwen_orientation(image_path, result)
+
+            with Image.open(image_path) as rotated:
+                self.assertEqual(rotated.size, (8, 12))
                 self.assertEqual(rotated.getpixel((0, 11)), (255, 0, 0))
-            self.assertIn("rotated crop 90deg", note)
+            self.assertIn("rotated crop 270deg clockwise", note)
+
+    def test_apply_qwen_orientation_does_not_rotate_low_confidence_crop(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "crop.png"
+            image = Image.new("RGB", (12, 8), "white")
+            image.putpixel((0, 0), (255, 0, 0))
+            image.save(image_path)
+            before = image_path.read_bytes()
+            result = OCRResult("qwen_scan", rotate_degrees=90, orientation_confidence=0.50)
+
+            note = _apply_qwen_orientation(image_path, result)
+
+            self.assertEqual(image_path.read_bytes(), before)
+            self.assertIn("orientation uncertain 90deg", note)
 
     def test_copy_final_crops_removes_stale_generated_files(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -260,7 +296,8 @@ class PipelineHelperTests(unittest.TestCase):
                 self.assertEqual(ws.max_row, 2)
                 self.assertEqual(ws.cell(2, 1).value, 1)
                 self.assertEqual(ws.cell(2, 9).value, "Unknown")
-                self.assertIn("needs human review", ws.cell(2, 13).value)
+                headers = {cell.value: cell.column for cell in ws[1]}
+                self.assertIn("needs human review", ws.cell(2, headers["System note"]).value)
             finally:
                 wb.close()
 
@@ -432,7 +469,53 @@ class PipelineHelperTests(unittest.TestCase):
             self.assertEqual(counted.count, 9)
             self.assertEqual(counter.calls, [root / "photo.jpg"])
 
-    def test_missing_date_is_filled_from_nearby_receipt(self):
+    def test_source_qa_marks_partial_qwen_failure_for_review(self):
+        qa = _source_qa_record(
+            Path("photo.jpg"),
+            VisualCountResult(None, reason="count skipped"),
+            3,
+            3,
+            failed_crop_count=1,
+        )
+
+        self.assertTrue(qa.needs_human_review)
+        self.assertIn("Qwen validation failed for 1 crop", qa.reason)
+
+    def test_qwen_only_resolver_retains_amount_when_seller_validation_fails(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = Settings(
+                root=root,
+                inbound_dir=root / "data" / "inbound",
+                trial_dir=root / "data" / "trial",
+                output_dir=root / "data" / "output",
+                baseline_dir=root / "data" / "baseline",
+            )
+            resolver = QwenOnlyResolver(settings)
+            qwen = OCRResult(
+                "qwen_scan",
+                [
+                    OCRTextLine(
+                        '{"invoice_date":"","expense_category":"Food","currency":"MXN",'
+                        '"total_amount":150,"expense_amount":150,"seller":"",'
+                        '"remarks":"Handwritten Nota De Cuenta"}',
+                        1.0,
+                    )
+                ],
+                None,
+                0.0,
+                "Qwen Scan JSON failed validation: seller",
+            )
+
+            with patch.object(resolver.qwen, "recognize", return_value=qwen):
+                resolved = resolver.scan(root / "crop.jpg")
+
+            self.assertEqual(resolved.record.total_amount, 150)
+            self.assertEqual(resolved.record.invoice_date, "")
+            self.assertEqual(resolved.record.expense_category, "Food")
+            self.assertIn("partial result retained", resolved.record.remarks)
+
+    def test_missing_date_remains_blank_next_to_dated_receipt(self):
         records = [
             InvoiceRecord(invoice_date="2026-06-12", seller="Printed", total_amount=100),
             InvoiceRecord(invoice_date="", seller="Handwritten", total_amount=150, remarks="Qwen Scan used"),
@@ -441,10 +524,10 @@ class PipelineHelperTests(unittest.TestCase):
 
         _fill_missing_dates_from_neighbors(records)
 
-        self.assertEqual(records[1].invoice_date, "2026-06-12")
-        self.assertIn("Missing date filled from nearby receipt", records[1].remarks)
+        self.assertEqual(records[1].invoice_date, "")
+        self.assertNotIn("Missing date filled", records[1].remarks)
 
-    def test_missing_dates_fall_back_to_source_photo_date(self):
+    def test_missing_date_does_not_fall_back_to_source_photo_date(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "photo.jpg"
             source.write_bytes(b"jpg")
@@ -454,8 +537,32 @@ class PipelineHelperTests(unittest.TestCase):
 
             _fill_missing_dates_from_neighbors(records)
 
-            self.assertRegex(records[0].invoice_date, r"^\d{4}-\d{2}-\d{2}$")
-            self.assertIn("Missing date filled from source photo date", records[0].remarks)
+            self.assertEqual(records[0].invoice_date, "")
+            self.assertNotIn("Missing date filled", records[0].remarks)
+
+    def test_missing_date_uses_unique_date_from_same_photo(self):
+        source = "telegram/photo.jpg"
+        dated = InvoiceRecord(invoice_date="2026-06-12", seller="Printed", total_amount=100, source_image=source)
+        undated = InvoiceRecord(invoice_date="", seller="Handwritten", total_amount=150, source_image=source)
+
+        _fill_missing_dates_from_neighbors([dated, undated], targets=[undated])
+
+        self.assertEqual(undated.invoice_date, "2026-06-12")
+        self.assertIn("Missing date filled from same photo: 2026-06-12", undated.remarks)
+
+    def test_missing_date_uses_nearest_unambiguous_batch_date_for_new_record_only(self):
+        historical_blank = InvoiceRecord(invoice_date="", seller="Old", total_amount=50)
+        nearby = InvoiceRecord(invoice_date="2026-06-18", seller="Printed", total_amount=100)
+        new_blank = InvoiceRecord(invoice_date="", seller="Handwritten", total_amount=150)
+
+        _fill_missing_dates_from_neighbors(
+            [historical_blank, nearby, new_blank],
+            targets=[new_blank],
+        )
+
+        self.assertEqual(historical_blank.invoice_date, "")
+        self.assertEqual(new_blank.invoice_date, "2026-06-18")
+        self.assertIn("Missing date filled from nearby batch receipt: 2026-06-18", new_blank.remarks)
 
 
 class FakeResolver:

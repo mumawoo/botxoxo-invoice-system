@@ -13,6 +13,7 @@ function Find-InvoicePython {
     if ($env:INVOICE_SYSTEM_PYTHON) {
         $candidates += $env:INVOICE_SYSTEM_PYTHON
     }
+    $candidates += Join-Path $repoRoot ".venv\Scripts\python.exe"
     if ($env:USERPROFILE) {
         $candidates += Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
     }

@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 import shutil
 import json
-from copy import copy
+from hashlib import sha256
+from copy import copy, deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -17,7 +18,7 @@ from openpyxl.worksheet.views import Selection
 from .expense_categories import EXPENSE_CATEGORIES, normalize_expense_category
 from .fx_rates import ExchangeRate, SAFE_CURRENCY_CODES, fetch_safe_exchange_rates, nearest_rate_on_or_before, normalize_safe_currency
 from .models import InvoiceRecord
-from .pairing import pair_invoice_payment_slips
+from .pairing import is_confident_invoice_payment_pair, is_possible_duplicate, pair_invoice_payment_slips
 from .parsing import normalize_date
 
 REIMBURSEMENT_WORKBOOK_NAME = "\u62a5\u9500\u660e\u7ec6_2026_xlsx.xlsx"
@@ -35,9 +36,14 @@ REVIEW_CROPS_DIR = "review_crops"
 FINAL_CROPS_DIR = "final_crops"
 FINAL_CROPS_MANIFEST = "final_crops_manifest.json"
 GROUP_ARCHIVE_DIR = "group_archive"
+SYSTEM_DIR = "system"
+SCAN_OUTPUT_WORKBOOK_NAME = "Scan_Output.xlsx"
+REVIEW_SYNC_STATE_NAME = "Review_Sync_State.json"
 MANUAL_STATUS_HEADER = "Manual status"
 TRACE_ID_HEADER = "Trace ID"
 SYSTEM_NOTE_HEADER = "System note"
+VAT_MXN_HEADER = "IVA/VAT MXN"
+TIPS_MXN_HEADER = "Tips MXN"
 
 REIMBURSEMENT_HEADERS = [
     "No.",
@@ -51,6 +57,8 @@ REIMBURSEMENT_HEADERS = [
     "Merchant",
     "Detail",
     "Accounting Category",
+    VAT_MXN_HEADER,
+    TIPS_MXN_HEADER,
     TRACE_ID_HEADER,
     SYSTEM_NOTE_HEADER,
     "Invoice link",
@@ -83,6 +91,8 @@ HEADER_ALIASES = {
     "Invoice link": {"invoice link", "link", "crop", "final crop", "\u56fe\u7247", "\u56fe\u7247\u94fe\u63a5"},
     "Date": {"date", "invoice date", "\u65e5\u671f"},
     "MXN Amount": {"mxn amount", "amount mxn", "\u62a5\u9500\u91d1\u989d", "\u6bd4\u7d22\u91d1\u989d"},
+    VAT_MXN_HEADER: {"iva/vat mxn", "iva vat mxn", "vat mxn", "iva mxn", "\u589e\u503c\u7a0e mxn"},
+    TIPS_MXN_HEADER: {"tips mxn", "tip mxn", "propina mxn", "\u5c0f\u8d39 mxn"},
     "Type": {"type", "\u7c7b\u578b", "\u8d39\u7528\u7c7b\u578b"},
     "\u539f\u5e01\u79cd": {"\u539f\u5e01\u79cd", "original currency", "currency"},
     "\u539f\u91d1\u989d": {"\u539f\u91d1\u989d", "original amount"},
@@ -102,6 +112,38 @@ class ReimbursementWriteResult:
     workbook_path: Path
     rates_updated: bool
     fx_error: str = ""
+
+
+@dataclass(frozen=True)
+class ReviewSyncResult:
+    workbook_path: Path
+    appended_records: tuple[InvoiceRecord, ...]
+    affected_records: tuple[InvoiceRecord, ...]
+    updated_trace_ids: tuple[str, ...]
+    warnings: tuple[str, ...]
+    already_committed: bool = False
+
+
+@dataclass(frozen=True)
+class ReviewSyncReverseResult:
+    workbook_path: Path
+    source_key: str
+    removed_rows: int
+    restored_trace_ids: tuple[str, ...]
+    trace_ids: tuple[str, ...]
+    used_legacy_fallback: bool = False
+
+
+@dataclass(frozen=True)
+class ReviewRepairPreview:
+    preview_id: str
+    directory: Path
+    current_review: Path
+    candidate_review: Path
+    report_path: Path
+    added: int
+    removed: int
+    changed: int
 
 
 @dataclass(frozen=True)
@@ -178,6 +220,14 @@ def reimbursement_workbook_path(output_dir: Path) -> Path:
     return output_dir / REIMBURSEMENT_WORKBOOK_NAME
 
 
+def scan_output_workbook_path(output_dir: Path) -> Path:
+    return output_dir / SYSTEM_DIR / SCAN_OUTPUT_WORKBOOK_NAME
+
+
+def review_sync_state_path(output_dir: Path) -> Path:
+    return output_dir / SYSTEM_DIR / REVIEW_SYNC_STATE_NAME
+
+
 def checked_workbook_path(output_dir: Path) -> Path:
     return output_dir / CHECKED_WORKBOOK_NAME
 
@@ -232,11 +282,14 @@ def load_reimbursement_records(path: Path) -> list[InvoiceRecord]:
         ws = _ensure_manual_sheet(wb)
         records: list[InvoiceRecord] = []
         columns = _header_columns(ws)
+        crop_links = _crop_link_map(wb)
         for row_idx in range(2, ws.max_row + 1):
             values = _row_values_by_header(ws, row_idx, columns)
             if _row_is_deleted(ws, row_idx) or not _looks_like_reimbursement_row(values):
                 continue
-            records.append(_record_from_reimbursement_row(values))
+            record = _record_from_reimbursement_row(values)
+            record.supporting_crop_images = list(crop_links.get(Path(record.crop_image).name, []))
+            records.append(record)
         return records
     finally:
         wb.close()
@@ -250,6 +303,8 @@ def change_reimbursement_record(
     category: str | None = None,
     amount: float | None = None,
     currency: str | None = None,
+    vat_amount: float | None = None,
+    tips: float | None = None,
     comment: str | None = None,
     status: str = "ok",
 ) -> ManualChangeResult:
@@ -279,6 +334,8 @@ def change_reimbursement_record(
             category=category,
             amount=amount,
             currency=currency,
+            vat_amount=vat_amount,
+            tips=tips,
             comment=comment,
             status=status,
         )
@@ -464,13 +521,20 @@ def available_crop_ids(output_dir: Path, limit: int = 8) -> list[str]:
     return ids[-limit:]
 
 
-def build_checked_outputs(output_dir: Path, force: bool = False) -> CheckedBuildResult:
+def build_checked_outputs(
+    output_dir: Path,
+    force: bool = False,
+    fetch_rates: FetchRates | None = None,
+    refresh_exchange_rates: bool = True,
+) -> CheckedBuildResult:
     workbook_path = reimbursement_workbook_path(output_dir)
     checked_path = checked_workbook_path(output_dir)
     final_dir = output_dir / FINAL_CROPS_DIR
     if not workbook_path.exists():
         return CheckedBuildResult(checked_path, final_dir, 0, 0, [])
 
+    if refresh_exchange_rates:
+        ReimbursementWorkbook(workbook_path, fetch_rates=fetch_rates).refresh_invoice_range_exchange_rates()
     wb = load_workbook(workbook_path, data_only=False)
     try:
         manual_ws = _ensure_manual_sheet(wb)
@@ -503,10 +567,8 @@ def build_checked_outputs(output_dir: Path, force: bool = False) -> CheckedBuild
             crop_sources.append(sources)
             if source is None:
                 missing.append(str(link or f"{manual_ws.title} row {row_idx}"))
-        try:
-            wb.save(workbook_path)
-        except OSError:
-            pass
+        # Reconciliation above is only for this checked projection. Review is
+        # authoritative and must not be saved as a side effect of /checked.
     finally:
         wb.close()
 
@@ -892,6 +954,8 @@ def _manual_values_from_checked(output_dir: Path, row: _CheckedFinanceRow, basel
         values_by_header.get("Merchant"),
         values_by_header.get("Detail"),
         category,
+        values_by_header.get(VAT_MXN_HEADER),
+        values_by_header.get(TIPS_MXN_HEADER),
         trace_id,
         "",
         f"{CROPS_DIR}/{final_name}",
@@ -1026,6 +1090,705 @@ def _record_is_protected_match(
     return _record_match_key(record, rates) in locked_keys
 
 
+def rebuild_scan_output(output_dir: Path, records: list[InvoiceRecord], pairing_mode: str = "auto") -> ReimbursementWriteResult:
+    """Rebuild the disposable machine workbook from OCR state."""
+
+    path = scan_output_workbook_path(output_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = pair_invoice_payment_slips(deepcopy(records), mode=pairing_mode)
+    assign_available_line_numbers(staged, ())
+    return ReimbursementWorkbook(path).write_records(staged)
+
+
+def sync_source_to_review(
+    output_dir: Path,
+    source_path: Path,
+    source_records: list[InvoiceRecord],
+    all_records: list[InvoiceRecord],
+    pairing_mode: str = "auto",
+    fetch_rates: FetchRates | None = None,
+) -> ReviewSyncResult:
+    """Apply one source's OCR result to the authoritative Review workbook."""
+
+    workbook_path = reimbursement_workbook_path(output_dir)
+    sync_path = review_sync_state_path(output_dir)
+    source_key = _sync_source_key(source_path)
+    state = _load_review_sync_state(sync_path)
+    if not state.get("initialized"):
+        state = _initialize_review_sync_state(output_dir, all_records)
+        _save_review_sync_state(sync_path, state)
+    recovered = _recover_pending_review_sync(output_dir, source_key, state, source_records)
+    if recovered is not None:
+        return recovered
+    if source_key in set(state.get("committed_sources", [])):
+        affected = _load_review_records_for_crop_ids(workbook_path, _record_trace_ids(source_records))
+        mutation = dict(state.get("mutations", {})).get(source_key, {})
+        saved_warnings = tuple(str(value) for value in mutation.get("warnings", []) if str(value or "")) if isinstance(mutation, dict) else ()
+        return ReviewSyncResult(workbook_path, (), tuple(affected), (), saved_warnings, True)
+
+    candidates = pair_invoice_payment_slips(deepcopy(source_records), mode=pairing_mode)
+    wb = _load_or_create_workbook(workbook_path)
+    appended: list[InvoiceRecord] = []
+    affected: list[InvoiceRecord] = []
+    updated_trace_ids: list[str] = []
+    warnings: list[str] = []
+    mutation: dict[str, object] = {
+        "source": source_key,
+        "trace_ids": sorted(_record_trace_ids(source_records)),
+        "appended_trace_ids": [],
+        "appended_primary_trace_ids": [],
+        "pair_updates": [],
+        "committed_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    try:
+        ws = _ensure_manual_sheet(wb)
+        columns = _header_columns(ws)
+        has_new_foreign_currency = any(_normalize_currency(record.currency) != "MXN" for record in candidates)
+        if has_new_foreign_currency:
+            rates, _, _ = ReimbursementWorkbook(workbook_path, fetch_rates=fetch_rates)._ensure_exchange_rates(
+                wb,
+                candidates,
+                force_full=True,
+            )
+        else:
+            rates = _rates_from_workbook(wb)
+        crop_links = _crop_link_map(wb)
+        existing_ids = _review_trace_ids(ws, crop_links)
+
+        for candidate in candidates:
+            candidate_ids = _record_trace_ids([candidate])
+            if candidate_ids & existing_ids:
+                affected.extend(_review_records_for_ids(ws, crop_links, candidate_ids))
+                continue
+
+            pair_row = _find_review_pair_row(ws, columns, candidate)
+            if pair_row is not None:
+                row_idx, old_record = pair_row
+                old_trace = _row_trace_id(ws, row_idx, columns)
+                if _row_is_protected(ws, row_idx):
+                    _append_invoice_remark(
+                        candidate,
+                        f"Possible pair with protected crop {old_trace}: same date, merchant and currency; human review required",
+                    )
+                    warnings.append(f"{_primary_trace_id(candidate)} may need combining with protected {old_trace}")
+                else:
+                    before, after, supporting_before, supporting_after = _apply_review_payment_update(
+                        ws, row_idx, columns, crop_links, old_record, candidate
+                    )
+                    mutation["pair_updates"].append(
+                        {
+                            "primary_trace_id": old_trace,
+                            "support_trace_ids": sorted(candidate_ids),
+                            "before": before,
+                            "after": after,
+                            "supporting_before": supporting_before,
+                            "supporting_after": supporting_after,
+                        }
+                    )
+                    updated_trace_ids.append(old_trace)
+                    existing_ids.update(candidate_ids)
+                    affected.extend(_review_records_for_ids(ws, crop_links, {old_trace}))
+                    continue
+            else:
+                reverse_row = _find_review_reverse_pair_row(ws, columns, candidate)
+                if reverse_row is not None:
+                    old_trace = _row_trace_id(ws, reverse_row, columns)
+                    _append_invoice_remark(
+                        candidate,
+                        f"Possible pair with existing payment crop {old_trace}: detail receipt arrived after payment; human review required",
+                    )
+                    warnings.append(f"{_primary_trace_id(candidate)} may need combining with existing payment {old_trace}")
+
+            duplicate_row = _find_review_duplicate_row(ws, columns, candidate)
+            if duplicate_row is not None:
+                old_trace = _row_trace_id(ws, duplicate_row, columns)
+                _append_invoice_remark(candidate, f"Possible duplicate with {old_trace}; human review required")
+                warnings.append(f"{_primary_trace_id(candidate)} may duplicate {old_trace}")
+
+            candidate.line_no = int(_primary_trace_id(candidate) or candidate.line_no or 0) or None
+            row_idx = max(ws.max_row + 1, 2)
+            _write_reimbursement_row(ws, row_idx, candidate, rates)
+            _set_crop_link_mapping(crop_links, candidate)
+            _format_row(ws, row_idx, _header_columns(ws))
+            appended.append(candidate)
+            affected.append(candidate)
+            existing_ids.update(candidate_ids)
+            mutation["appended_trace_ids"].extend(sorted(candidate_ids))
+            mutation["appended_primary_trace_ids"].append(_primary_trace_id(candidate))
+
+        _write_crop_links_sheet(wb, crop_links)
+        _format_invoice_exp(ws)
+        _autosize(ws, max_col=len(REIMBURSEMENT_HEADERS))
+        mutation["warnings"] = list(warnings)
+        pending = dict(state.get("pending_mutations", {}))
+        pending[source_key] = mutation
+        state["pending_mutations"] = pending
+        _save_review_sync_state(sync_path, state)
+        _save_workbook_atomic(wb, workbook_path)
+    finally:
+        wb.close()
+
+    committed = set(state.get("committed_sources", []))
+    committed.add(source_key)
+    state["committed_sources"] = sorted(committed)
+    mutations = dict(state.get("mutations", {}))
+    mutations[source_key] = mutation
+    state["mutations"] = mutations
+    pending = dict(state.get("pending_mutations", {}))
+    pending.pop(source_key, None)
+    state["pending_mutations"] = pending
+    _save_review_sync_state(sync_path, state)
+    return ReviewSyncResult(
+        workbook_path,
+        tuple(appended),
+        tuple(_dedupe_invoice_records(affected)),
+        tuple(updated_trace_ids),
+        tuple(warnings),
+        False,
+    )
+
+
+def _initialize_review_sync_state(output_dir: Path, records: list[InvoiceRecord]) -> dict[str, object]:
+    workbook_path = reimbursement_workbook_path(output_dir)
+    existing_ids: set[str] = set()
+    if workbook_path.exists():
+        wb = load_workbook(workbook_path, data_only=False)
+        try:
+            ws = _ensure_manual_sheet(wb)
+            existing_ids = _review_trace_ids(ws, _crop_link_map(wb))
+        finally:
+            wb.close()
+    by_source: dict[str, set[str]] = {}
+    for record in records:
+        source = _sync_source_key(Path(str(record.source_image or "")))
+        if source:
+            by_source.setdefault(source, set()).update(_record_trace_ids([record]))
+    committed = sorted(source for source, trace_ids in by_source.items() if trace_ids and trace_ids <= existing_ids)
+    return {
+        "version": 1,
+        "initialized": True,
+        "initialized_at": datetime.now().isoformat(timespec="seconds"),
+        "committed_sources": committed,
+        "mutations": {},
+        "pending_mutations": {},
+    }
+
+
+def _load_review_sync_state(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_review_sync_state(path: Path, data: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(path)
+
+
+def initialize_review_architecture(
+    output_dir: Path,
+    records: list[InvoiceRecord],
+    pairing_mode: str = "auto",
+) -> tuple[Path, Path]:
+    """Create machine staging and initial sync metadata without writing Review."""
+
+    rebuild_scan_output(output_dir, records, pairing_mode)
+    sync_path = review_sync_state_path(output_dir)
+    if not sync_path.exists():
+        _save_review_sync_state(sync_path, _initialize_review_sync_state(output_dir, records))
+    return scan_output_workbook_path(output_dir), sync_path
+
+
+def preview_review_repair(
+    output_dir: Path,
+    records: list[InvoiceRecord],
+    pairing_mode: str = "auto",
+) -> ReviewRepairPreview:
+    """Archive and compare Review with a machine reconstruction without applying it."""
+
+    review_path = reimbursement_workbook_path(output_dir)
+    if not review_path.exists():
+        raise FileNotFoundError(str(review_path))
+    rebuild_scan_output(output_dir, records, pairing_mode)
+    preview_id = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    directory = output_dir / SYSTEM_DIR / "repair_previews" / preview_id
+    directory.mkdir(parents=True, exist_ok=False)
+    current_copy = directory / "Review_before.xlsx"
+    candidate_copy = directory / "Review_from_scan_output.xlsx"
+    shutil.copy2(review_path, current_copy)
+    shutil.copy2(scan_output_workbook_path(output_dir), candidate_copy)
+    current_rows = _repair_rows_by_trace(current_copy)
+    candidate_rows = _repair_rows_by_trace(candidate_copy)
+    added = sorted(set(candidate_rows) - set(current_rows))
+    removed = sorted(set(current_rows) - set(candidate_rows))
+    changed = sorted(
+        trace_id for trace_id in set(current_rows) & set(candidate_rows) if current_rows[trace_id] != candidate_rows[trace_id]
+    )
+    report_path = directory / "Repair_Preview.json"
+    report = {
+        "version": 1,
+        "preview_id": preview_id,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "active_review": str(review_path),
+        "active_review_sha256": _path_sha256(review_path),
+        "candidate": candidate_copy.name,
+        "added_trace_ids": added,
+        "removed_trace_ids": removed,
+        "changed_trace_ids": changed,
+        "confirmation_warning": "Confirming replaces Review with machine Scan Output. Manual-only edits are not copied backward.",
+    }
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return ReviewRepairPreview(
+        preview_id, directory, current_copy, candidate_copy, report_path, len(added), len(removed), len(changed)
+    )
+
+
+def confirm_review_repair(
+    output_dir: Path,
+    preview_id: str,
+    records: list[InvoiceRecord],
+) -> Path:
+    """Apply one unchanged repair preview after explicit CLI confirmation."""
+
+    normalized_id = str(preview_id or "").strip()
+    if not re.fullmatch(r"\d{8}-\d{6}-\d{6}", normalized_id):
+        raise ValueError("Invalid repair preview ID")
+    directory = output_dir / SYSTEM_DIR / "repair_previews" / normalized_id
+    report_path = directory / "Repair_Preview.json"
+    candidate = directory / "Review_from_scan_output.xlsx"
+    review_path = reimbursement_workbook_path(output_dir)
+    if not report_path.exists() or not candidate.exists() or not review_path.exists():
+        raise FileNotFoundError("Repair preview is incomplete or no longer available")
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    if _path_sha256(review_path) != str(report.get("active_review_sha256") or ""):
+        raise RuntimeError("Review changed after preview. Create a new repair preview; nothing was replaced.")
+    before_confirm = directory / "Review_at_confirm.xlsx"
+    shutil.copy2(review_path, before_confirm)
+    temp = review_path.with_name(f".{review_path.stem}.repair.tmp{review_path.suffix}")
+    shutil.copy2(candidate, temp)
+    temp.replace(review_path)
+    _save_review_sync_state(review_sync_state_path(output_dir), _initialize_review_sync_state(output_dir, records))
+    report["confirmed_at"] = datetime.now().isoformat(timespec="seconds")
+    report["confirmed_review_sha256"] = _path_sha256(review_path)
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    return review_path
+
+
+def _repair_rows_by_trace(path: Path) -> dict[str, dict[str, object]]:
+    wb = load_workbook(path, data_only=False)
+    try:
+        ws = _ensure_manual_sheet(wb)
+        columns = _header_columns(ws)
+        rows: dict[str, dict[str, object]] = {}
+        for row_idx in range(2, ws.max_row + 1):
+            trace_id = _row_trace_id(ws, row_idx, columns)
+            values = _row_values_by_header(ws, row_idx, columns)
+            if not trace_id or not _looks_like_reimbursement_row(values):
+                continue
+            rows[trace_id] = {
+                header: _repair_json_value(ws.cell(row_idx, col).value)
+                for header, col in columns.items()
+                if header in REIMBURSEMENT_HEADERS
+            }
+        return rows
+    finally:
+        wb.close()
+
+
+def _repair_json_value(value: object) -> object:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return value
+
+
+def _path_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _recover_pending_review_sync(
+    output_dir: Path,
+    source_key: str,
+    state: dict[str, object],
+    source_records: list[InvoiceRecord],
+) -> ReviewSyncResult | None:
+    pending = dict(state.get("pending_mutations", {}))
+    mutation = pending.get(source_key)
+    if not isinstance(mutation, dict):
+        return None
+    workbook_path = reimbursement_workbook_path(output_dir)
+    if workbook_path.exists():
+        wb = load_workbook(workbook_path, data_only=False)
+        try:
+            applied = _review_mutation_matches(wb, mutation, "after")
+            untouched = _review_mutation_matches(wb, mutation, "before")
+        finally:
+            wb.close()
+    else:
+        applied = False
+        untouched = _review_mutation_matches(None, mutation, "before")
+
+    sync_path = review_sync_state_path(output_dir)
+    if applied:
+        committed = set(state.get("committed_sources", []))
+        committed.add(source_key)
+        state["committed_sources"] = sorted(committed)
+        mutations = dict(state.get("mutations", {}))
+        mutations[source_key] = mutation
+        state["mutations"] = mutations
+        pending.pop(source_key, None)
+        state["pending_mutations"] = pending
+        _save_review_sync_state(sync_path, state)
+        affected = _load_review_records_for_crop_ids(workbook_path, _record_trace_ids(source_records))
+        warnings = tuple(str(value) for value in mutation.get("warnings", []) if str(value or ""))
+        return ReviewSyncResult(workbook_path, (), tuple(affected), (), warnings, True)
+    if untouched:
+        pending.pop(source_key, None)
+        state["pending_mutations"] = pending
+        _save_review_sync_state(sync_path, state)
+        return None
+    raise RuntimeError(
+        "Review synchronization is partially applied. Close Excel and run the CLI repair preview; no Review cells were overwritten."
+    )
+
+
+def _review_mutation_matches(wb, mutation: dict[str, object], target: str) -> bool:
+    appended = {
+        _normalize_crop_id(value)
+        for value in mutation.get("appended_primary_trace_ids", [])
+        if str(value or "").strip()
+    }
+    pair_updates = [item for item in mutation.get("pair_updates", []) if isinstance(item, dict)]
+    if wb is None:
+        return target == "before" and not pair_updates
+    ws = _ensure_manual_sheet(wb)
+    columns = _header_columns(ws)
+    crop_links = _crop_link_map(wb)
+    existing = {_row_trace_id(ws, row_idx, columns) for row_idx in range(2, ws.max_row + 1)}
+    if target == "after" and not appended <= existing:
+        return False
+    if target == "before" and appended & existing:
+        return False
+    for update in pair_updates:
+        trace_id = _normalize_crop_id(str(update.get("primary_trace_id") or ""))
+        row_idx = _find_row_by_crop_id(ws, columns, trace_id)
+        if row_idx is None:
+            return False
+        expected = update.get(target)
+        if not isinstance(expected, dict):
+            return False
+        actual = {header: ws.cell(row_idx, columns[header]).value for header in expected if header in columns}
+        if actual != expected:
+            return False
+        link_col = columns.get("Invoice link", len(REIMBURSEMENT_HEADERS))
+        link_cell = ws.cell(row_idx, link_col)
+        primary_link = str(link_cell.hyperlink.target if link_cell.hyperlink else link_cell.value or "")
+        support_key = "supporting_after" if target == "after" else "supporting_before"
+        expected_support = sorted(str(value) for value in update.get(support_key, []) if str(value or "").strip())
+        actual_support = sorted(crop_links.get(Path(primary_link).name, []))
+        if actual_support != expected_support:
+            return False
+    return True
+
+
+def reverse_review_sync_for_source(
+    output_dir: Path,
+    source_path: Path,
+    fallback_trace_ids: set[str] | None = None,
+) -> ReviewSyncReverseResult:
+    """Reverse only Review mutations committed for one source photo."""
+
+    workbook_path = reimbursement_workbook_path(output_dir)
+    sync_path = review_sync_state_path(output_dir)
+    source_key = _sync_source_key(source_path)
+    state = _load_review_sync_state(sync_path)
+    mutations = dict(state.get("mutations", {}))
+    mutation = mutations.get(source_key)
+    if not isinstance(mutation, dict):
+        trace_ids = {_normalize_crop_id(value) for value in (fallback_trace_ids or set())}
+        if trace_ids and workbook_path.exists():
+            wb = load_workbook(workbook_path, data_only=False)
+            try:
+                support_ids = {
+                    trace_id
+                    for supports in _crop_link_map(wb).values()
+                    for value in supports
+                    if (trace_id := _trace_id_from_link(value))
+                }
+            finally:
+                wb.close()
+            if trace_ids & support_ids:
+                raise RuntimeError(
+                    "Cannot rollback this pre-migration paired source safely because no reversible financial snapshot exists"
+                )
+        removed = remove_reimbursement_rows_by_trace_ids(output_dir, trace_ids)
+        committed = set(state.get("committed_sources", []))
+        committed.discard(source_key)
+        state["committed_sources"] = sorted(committed)
+        if state:
+            _save_review_sync_state(sync_path, state)
+        return ReviewSyncReverseResult(
+            workbook_path, source_key, removed, (), tuple(sorted(trace_ids)), True
+        )
+
+    if not workbook_path.exists():
+        raise FileNotFoundError(str(workbook_path))
+    wb = load_workbook(workbook_path, data_only=False)
+    removed = 0
+    restored: list[str] = []
+    trace_ids = {
+        _normalize_crop_id(value)
+        for value in mutation.get("trace_ids", [])
+        if str(value or "").strip()
+    }
+    try:
+        ws = _ensure_manual_sheet(wb)
+        columns = _header_columns(ws)
+        crop_links = _crop_link_map(wb)
+        for update in [item for item in mutation.get("pair_updates", []) if isinstance(item, dict)]:
+            trace_id = _normalize_crop_id(str(update.get("primary_trace_id") or ""))
+            row_idx = _find_row_by_crop_id(ws, columns, trace_id)
+            if row_idx is None:
+                raise RuntimeError(f"Cannot rollback: Review row {trace_id} no longer exists")
+            after = update.get("after")
+            before = update.get("before")
+            if not isinstance(after, dict) or not isinstance(before, dict):
+                raise RuntimeError(f"Cannot rollback: mutation snapshot for {trace_id} is incomplete")
+            actual = {header: ws.cell(row_idx, columns[header]).value for header in after if header in columns}
+            if actual != after:
+                raise RuntimeError(
+                    f"Cannot rollback: financial fields in Review row {trace_id} were edited after synchronization"
+                )
+            for header, value in before.items():
+                if header in columns:
+                    ws.cell(row_idx, columns[header]).value = value
+            link_col = columns.get("Invoice link", len(REIMBURSEMENT_HEADERS))
+            link_cell = ws.cell(row_idx, link_col)
+            primary_link = str(link_cell.hyperlink.target if link_cell.hyperlink else link_cell.value or "")
+            supporting_before = [str(value) for value in update.get("supporting_before", []) if str(value or "").strip()]
+            if supporting_before:
+                crop_links[Path(primary_link).name] = supporting_before
+            else:
+                crop_links.pop(Path(primary_link).name, None)
+            restored.append(trace_id)
+
+        appended = {
+            _normalize_crop_id(value)
+            for value in mutation.get("appended_primary_trace_ids", [])
+            if str(value or "").strip()
+        }
+        for row_idx in range(ws.max_row, 1, -1):
+            if _row_trace_id(ws, row_idx, columns) in appended:
+                ws.delete_rows(row_idx, 1)
+                removed += 1
+        _write_crop_links_sheet(wb, crop_links)
+        _format_invoice_exp(ws)
+        _save_workbook_atomic(wb, workbook_path)
+    finally:
+        wb.close()
+
+    mutations.pop(source_key, None)
+    state["mutations"] = mutations
+    pending = dict(state.get("pending_mutations", {}))
+    pending.pop(source_key, None)
+    state["pending_mutations"] = pending
+    committed = set(state.get("committed_sources", []))
+    committed.discard(source_key)
+    state["committed_sources"] = sorted(committed)
+    _save_review_sync_state(sync_path, state)
+    return ReviewSyncReverseResult(
+        workbook_path, source_key, removed, tuple(restored), tuple(sorted(trace_ids)), False
+    )
+
+
+def _save_workbook_atomic(wb, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.stem}.tmp{path.suffix}")
+    try:
+        wb.save(temp)
+        temp.replace(path)
+    except Exception:
+        if temp.exists():
+            temp.unlink()
+        raise
+
+
+def _sync_source_key(path: Path) -> str:
+    if not str(path):
+        return ""
+    try:
+        return str(path.resolve()).casefold()
+    except OSError:
+        return str(path).casefold()
+
+
+def _record_trace_ids(records: Iterable[InvoiceRecord]) -> set[str]:
+    ids: set[str] = set()
+    for record in records:
+        for value in [record.crop_image, *list(getattr(record, "supporting_crop_images", []) or [])]:
+            trace_id = _trace_id_from_link(value)
+            if trace_id:
+                ids.add(trace_id)
+    return ids
+
+
+def _primary_trace_id(record: InvoiceRecord) -> str:
+    return _trace_id_from_link(record.crop_image) or (f"{record.line_no:03d}" if record.line_no else "")
+
+
+def _review_trace_ids(ws, crop_links: dict[str, list[str]]) -> set[str]:
+    columns = _header_columns(ws)
+    ids = {
+        trace_id
+        for row_idx in range(2, ws.max_row + 1)
+        if (trace_id := _row_trace_id(ws, row_idx, columns))
+    }
+    for primary, supports in crop_links.items():
+        primary_id = _trace_id_from_link(primary)
+        if primary_id:
+            ids.add(primary_id)
+        ids.update(filter(None, (_trace_id_from_link(value) for value in supports)))
+    return ids
+
+
+def _review_records_for_ids(ws, crop_links: dict[str, list[str]], trace_ids: set[str]) -> list[InvoiceRecord]:
+    columns = _header_columns(ws)
+    records: list[InvoiceRecord] = []
+    for row_idx in range(2, ws.max_row + 1):
+        primary_id = _row_trace_id(ws, row_idx, columns)
+        link = str(ws.cell(row_idx, columns.get("Invoice link", len(REIMBURSEMENT_HEADERS))).value or "")
+        support_ids = {_trace_id_from_link(value) for value in crop_links.get(Path(link).name, [])}
+        if primary_id not in trace_ids and not (support_ids & trace_ids):
+            continue
+        values = _row_values_by_header(ws, row_idx, columns)
+        if _looks_like_reimbursement_row(values):
+            record = _record_from_reimbursement_row(values)
+            record.supporting_crop_images = list(crop_links.get(Path(link).name, []))
+            records.append(record)
+    return records
+
+
+def _load_review_records_for_crop_ids(path: Path, trace_ids: set[str]) -> list[InvoiceRecord]:
+    if not path.exists() or not trace_ids:
+        return []
+    wb = load_workbook(path, data_only=True)
+    try:
+        ws = _ensure_manual_sheet(wb)
+        return _review_records_for_ids(ws, _crop_link_map(wb), trace_ids)
+    finally:
+        wb.close()
+
+
+def _review_pairing_record(values: list[object]) -> InvoiceRecord:
+    record = _record_from_reimbursement_row(values)
+    if _normalize_currency(record.currency) != "MXN":
+        record.total_amount = float(getattr(record, "original_amount", 0) or record.total_amount)
+    return record
+
+
+def _find_review_pair_row(ws, columns: dict[str, int], payment: InvoiceRecord) -> tuple[int, InvoiceRecord] | None:
+    for row_idx in range(2, ws.max_row + 1):
+        if _row_is_deleted(ws, row_idx):
+            continue
+        values = _row_values_by_header(ws, row_idx, columns)
+        if not _looks_like_reimbursement_row(values):
+            continue
+        invoice = _review_pairing_record(values)
+        if is_confident_invoice_payment_pair(invoice, payment):
+            return row_idx, invoice
+    return None
+
+
+def _find_review_reverse_pair_row(ws, columns: dict[str, int], invoice: InvoiceRecord) -> int | None:
+    for row_idx in range(2, ws.max_row + 1):
+        if _row_is_deleted(ws, row_idx):
+            continue
+        values = _row_values_by_header(ws, row_idx, columns)
+        if not _looks_like_reimbursement_row(values):
+            continue
+        payment = _review_pairing_record(values)
+        if is_confident_invoice_payment_pair(invoice, payment):
+            return row_idx
+    return None
+
+
+def _find_review_duplicate_row(ws, columns: dict[str, int], candidate: InvoiceRecord) -> int | None:
+    for row_idx in range(2, ws.max_row + 1):
+        if _row_is_deleted(ws, row_idx):
+            continue
+        values = _row_values_by_header(ws, row_idx, columns)
+        if not _looks_like_reimbursement_row(values):
+            continue
+        if is_possible_duplicate(_review_pairing_record(values), candidate):
+            return row_idx
+    return None
+
+
+def _apply_review_payment_update(
+    ws,
+    row_idx: int,
+    columns: dict[str, int],
+    crop_links: dict[str, list[str]],
+    invoice: InvoiceRecord,
+    payment: InvoiceRecord,
+) -> tuple[dict[str, object], dict[str, object], list[str], list[str]]:
+    tracked = ["MXN Amount", "\u539f\u91d1\u989d", TIPS_MXN_HEADER, SYSTEM_NOTE_HEADER]
+    before = {header: ws.cell(row_idx, columns[header]).value for header in tracked if header in columns}
+    currency = _normalize_currency(invoice.currency)
+    multiplier = float(ws.cell(row_idx, columns.get("\u6c47\u7387", 8)).value or 1.0)
+    invoice_original = float(getattr(invoice, "original_amount", 0) or invoice.total_amount)
+    delta = max(round(payment.total_amount - invoice_original, 2), 0.0)
+    payment_mxn = round(payment.total_amount * multiplier, 2)
+    tip_mxn = round(max(float(payment.tips or 0), delta) * multiplier, 2)
+    ws.cell(row_idx, columns["MXN Amount"]).value = payment_mxn
+    if currency != "MXN" and "\u539f\u91d1\u989d" in columns:
+        ws.cell(row_idx, columns["\u539f\u91d1\u989d"]).value = round(payment.total_amount, 2)
+    if TIPS_MXN_HEADER in columns:
+        current_tip = float(ws.cell(row_idx, columns[TIPS_MXN_HEADER]).value or 0)
+        ws.cell(row_idx, columns[TIPS_MXN_HEADER]).value = max(current_tip, tip_mxn)
+    primary_link = str(ws.cell(row_idx, columns.get("Invoice link", len(REIMBURSEMENT_HEADERS))).value or "")
+    supporting_before = list(crop_links.get(Path(primary_link).name, []))
+    support_ids = sorted(_record_trace_ids([payment]))
+    support_label = " + ".join(support_ids)
+    note = f"Combined payment slip {support_label}; tips calculated as {tip_mxn:.2f}; supporting crop {support_label} kept"
+    note_cell = ws.cell(row_idx, columns[SYSTEM_NOTE_HEADER])
+    if note not in str(note_cell.value or ""):
+        note_cell.value = f"{note_cell.value}; {note}" if note_cell.value else note
+    supports = crop_links.setdefault(Path(primary_link).name, [])
+    for crop in [payment.crop_image, *list(payment.supporting_crop_images or [])]:
+        if crop and crop not in supports:
+            supports.append(crop)
+    after = {header: ws.cell(row_idx, columns[header]).value for header in tracked if header in columns}
+    supporting_after = list(crop_links.get(Path(primary_link).name, []))
+    return before, after, supporting_before, supporting_after
+
+
+def _append_invoice_remark(record: InvoiceRecord, remark: str) -> None:
+    if remark not in str(record.remarks or ""):
+        record.remarks = f"{record.remarks}; {remark}" if record.remarks else remark
+
+
+def _dedupe_invoice_records(records: list[InvoiceRecord]) -> list[InvoiceRecord]:
+    output: list[InvoiceRecord] = []
+    seen: set[str] = set()
+    for record in records:
+        key = _primary_trace_id(record) or repr(record.stable_key())
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(record)
+    return output
+
+
 class ReimbursementWorkbook:
     def __init__(self, workbook_path: Path, fetch_rates: FetchRates | None = None) -> None:
         self.workbook_path = workbook_path
@@ -1086,7 +1849,7 @@ class ReimbursementWorkbook:
         _write_crop_links_sheet(wb, crop_links)
         _format_invoice_exp(ws)
         _autosize(ws, max_col=len(REIMBURSEMENT_HEADERS))
-        wb.save(self.workbook_path)
+        _save_workbook_atomic(wb, self.workbook_path)
         wb.close()
         return ReimbursementWriteResult(rows_written, self.workbook_path, rates_updated, fx_error)
 
@@ -1106,27 +1869,56 @@ class ReimbursementWorkbook:
             error = str(exc).strip() or exc.__class__.__name__
         merged = _merge_rates(existing, fetched)
         _write_exchange_rate_sheet(wb, merged)
-        wb.save(self.workbook_path)
+        _save_workbook_atomic(wb, self.workbook_path)
         wb.close()
         return ExchangeRateUpdateResult(self.workbook_path, start_date, end_date, len(existing), len(fetched), len(merged), error)
 
-    def _ensure_exchange_rates(self, wb, records: list[InvoiceRecord]) -> tuple[list[ExchangeRate], bool, str]:
+    def refresh_invoice_range_exchange_rates(self) -> ExchangeRateUpdateResult:
+        """Fill missing cached rates across the active invoice date range."""
+
+        wb = _load_or_create_workbook(self.workbook_path)
         existing = _rates_from_workbook(wb)
-        fx_currencies = {
-            _normalize_currency(record.currency)
-            for record in records
-            if _normalize_currency(record.currency) != "MXN"
-        }
-        fx_dates = [_record_date(record) for record in records if _normalize_currency(record.currency) != "MXN"]
-        fx_dates = [value for value in fx_dates if value is not None]
-        if not fx_dates:
+        invoice_dates, _ = _exchange_rate_requirements(wb, [])
+        if not invoice_dates:
+            wb.close()
+            today = date.today()
+            return ExchangeRateUpdateResult(self.workbook_path, today, today, len(existing), 0, len(existing), "")
+
+        start_date = min(invoice_dates)
+        end_date = max(invoice_dates)
+        merged, rates_updated, error = self._ensure_exchange_rates(wb, [], force_full=True)
+        if rates_updated:
+            _save_workbook_atomic(wb, self.workbook_path)
+        wb.close()
+        return ExchangeRateUpdateResult(
+            self.workbook_path,
+            start_date,
+            end_date,
+            len(existing),
+            max(0, len(merged) - len(existing)),
+            len(merged),
+            error,
+        )
+
+    def _ensure_exchange_rates(
+        self,
+        wb,
+        records: list[InvoiceRecord],
+        force_full: bool = False,
+    ) -> tuple[list[ExchangeRate], bool, str]:
+        existing = _rates_from_workbook(wb)
+        invoice_dates, fx_currencies = _exchange_rate_requirements(wb, records)
+        if not invoice_dates or (not fx_currencies and not force_full):
             _write_exchange_rate_sheet(wb, existing)
             return existing, False, ""
-        needed_start = min(fx_dates)
-        needed_end = max(max(fx_dates), date.today())
-        ranges = _missing_rate_ranges(existing, needed_start, needed_end)
-        if any(_currency_needs_refresh(existing, currency, needed_start, needed_end) for currency in fx_currencies):
-            ranges.append((needed_start, needed_end))
+        needed_start = min(invoice_dates)
+        needed_end = max(invoice_dates)
+        if force_full:
+            ranges = [(needed_start - timedelta(days=10), needed_end)]
+        else:
+            ranges = _missing_rate_ranges(existing, needed_start, needed_end)
+            if any(_currency_needs_refresh(existing, currency, needed_start, needed_end) for currency in fx_currencies):
+                ranges.append((needed_start, needed_end))
         ranges = _dedupe_ranges(ranges)
         fetched: list[ExchangeRate] = []
         errors: list[str] = []
@@ -1141,8 +1933,10 @@ class ReimbursementWorkbook:
             except Exception as exc:
                 errors.append(str(exc).strip() or exc.__class__.__name__)
         merged = _merge_rates(existing, fetched)
-        _write_exchange_rate_sheet(wb, merged)
-        return merged, bool(fetched), "; ".join(errors)
+        daily_rates = _daily_rate_window(merged, needed_start, needed_end)
+        changed = _rate_table_signature(existing) != _rate_table_signature(daily_rates)
+        _write_exchange_rate_sheet(wb, daily_rates, replace=True)
+        return daily_rates, changed, "; ".join(errors)
 
 
 def assign_available_line_numbers(records: list[InvoiceRecord], locked_numbers: Iterable[int]) -> None:
@@ -1278,6 +2072,7 @@ def _reconcile_manual_links_to_processing_state(output_dir: Path, ws, columns: d
         return False
     records = [item for item in data.get("records", []) if isinstance(item, dict)]
     by_key: dict[tuple[str, str, str, float], list[dict]] = {}
+    by_trace: dict[str, dict] = {}
     for record in records:
         crop_text = str(record.get("crop_image") or "").strip()
         if not crop_text:
@@ -1285,6 +2080,9 @@ def _reconcile_manual_links_to_processing_state(output_dir: Path, ws, columns: d
         crop_path = Path(crop_text)
         if not crop_path.exists():
             continue
+        trace_id = _trace_id_from_link(crop_path.name)
+        if trace_id:
+            by_trace[trace_id] = record
         key = _processing_record_key(record)
         by_key.setdefault(key, []).append(record)
     if not by_key:
@@ -1292,10 +2090,43 @@ def _reconcile_manual_links_to_processing_state(output_dir: Path, ws, columns: d
     used: set[str] = set()
     changed = False
     link_col = columns.get("Invoice link", len(REIMBURSEMENT_HEADERS))
+    trace_col = columns.get(TRACE_ID_HEADER)
     for row_idx in range(2, ws.max_row + 1):
         values = _row_values_by_header(ws, row_idx, columns)
         if not _looks_like_reimbursement_row(values):
             continue
+        cell = ws.cell(row_idx, link_col)
+        current_link = str(cell.hyperlink.target if cell.hyperlink else cell.value or "").strip()
+        current_trace = _trace_id_from_link(current_link)
+        explicit_trace = ""
+        if trace_col:
+            raw_trace = str(ws.cell(row_idx, trace_col).value or "").strip()
+            if raw_trace:
+                explicit_trace = _normalize_crop_id(raw_trace)
+
+        # Trace ID is the Review workbook's identity. Once present, never
+        # remap the row merely because another receipt has the same values.
+        identity_trace = explicit_trace or current_trace or ""
+        if identity_trace:
+            selected = by_trace.get(identity_trace)
+            if selected is not None:
+                source = Path(str(selected.get("crop_image") or ""))
+                if source.exists():
+                    used.add(source.name)
+                    if Path(current_link).name != source.name:
+                        value = _relative_crop_link(output_dir, source)
+                        cell.value = value
+                        cell.hyperlink = value
+                        cell.style = "Hyperlink"
+                        changed = True
+            else:
+                current_source = _resolve_crop_source(output_dir, current_link)
+                if current_source is not None:
+                    used.add(current_source.name)
+            continue
+
+        # Value-based reconciliation is only a legacy repair path for rows
+        # that have no Trace ID in either the column or crop link.
         key = _row_crop_match_key(values)
         candidates = by_key.get(key, [])
         if not candidates:
@@ -1313,7 +2144,6 @@ def _reconcile_manual_links_to_processing_state(output_dir: Path, ws, columns: d
             continue
         used.add(source.name)
         value = _relative_crop_link(output_dir, source)
-        cell = ws.cell(row_idx, link_col)
         current_name = Path(str(cell.hyperlink.target if cell.hyperlink else cell.value or "")).name
         if current_name == source.name:
             continue
@@ -1462,15 +2292,23 @@ def _sync_no_to_crop_ids(ws, columns: dict[str, int]) -> bool:
     for row_idx in range(2, ws.max_row + 1):
         link_cell = ws.cell(row_idx, link_col)
         link = str(link_cell.hyperlink.target if link_cell.hyperlink else link_cell.value or "")
-        trace_id = _trace_id_from_link(link)
-        crop_no = _crop_no_from_link(link)
+        explicit_trace = ""
+        if trace_col:
+            raw_trace = str(ws.cell(row_idx, trace_col).value or "").strip()
+            if raw_trace:
+                explicit_trace = _normalize_crop_id(raw_trace)
+        trace_id = explicit_trace or (_trace_id_from_link(link) or "")
+        try:
+            crop_no = int(trace_id) if trace_id else None
+        except ValueError:
+            crop_no = None
         if crop_no is None:
             continue
         no_cell = ws.cell(row_idx, no_col)
         if _to_int(no_cell.value) != crop_no:
             no_cell.value = crop_no
             changed = True
-        if trace_col and trace_id and str(ws.cell(row_idx, trace_col).value or "").zfill(3) != trace_id:
+        if trace_col and trace_id and not explicit_trace:
             ws.cell(row_idx, trace_col).value = trace_id
             changed = True
     return changed
@@ -1528,14 +2366,19 @@ def _apply_manual_change(
     category: str | None,
     amount: float | None,
     currency: str | None,
+    vat_amount: float | None,
+    tips: float | None,
     comment: str | None,
     status: str,
 ) -> None:
-    if invoice_date:
-        parsed_date = _parse_date(invoice_date)
-        if parsed_date is None:
-            raise ValueError(f"Invalid date: {invoice_date}")
-        ws.cell(row_idx, columns["Date"]).value = parsed_date
+    if invoice_date is not None:
+        if str(invoice_date).strip():
+            parsed_date = _parse_date(invoice_date)
+            if parsed_date is None:
+                raise ValueError(f"Invalid date: {invoice_date}")
+            ws.cell(row_idx, columns["Date"]).value = parsed_date
+        else:
+            ws.cell(row_idx, columns["Date"]).value = None
     if category:
         category_en = _manual_category(category)
         ws.cell(row_idx, columns["Accounting Category"]).value = category_en
@@ -1560,6 +2403,10 @@ def _apply_manual_change(
         ws.cell(row_idx, columns["\u539f\u5e01\u79cd"]).value = new_currency
         ws.cell(row_idx, columns["\u539f\u91d1\u989d"]).value = round(new_amount, 2)
         ws.cell(row_idx, columns["\u6c47\u7387"]).value = fx_multiplier
+    if vat_amount is not None and VAT_MXN_HEADER in columns:
+        ws.cell(row_idx, columns[VAT_MXN_HEADER]).value = round(float(vat_amount), 2)
+    if tips is not None and TIPS_MXN_HEADER in columns:
+        ws.cell(row_idx, columns[TIPS_MXN_HEADER]).value = round(float(tips), 2)
     ws.cell(row_idx, columns[MANUAL_STATUS_HEADER]).value = _normalize_manual_status(status)
     _format_row(ws, row_idx, columns)
 
@@ -2030,6 +2877,9 @@ def _reimbursement_value_map(record: InvoiceRecord, rates: list[ExchangeRate]) -
     rate_date = _record_date(record) or date.today()
     rate = _best_rate_for_date(rates, rate_date)
     mxn_amount, fx_multiplier = _mxn_amount(original_amount, original_currency, rate)
+    report_components = bool(getattr(record, "report_components", False))
+    vat_mxn = _component_amount_mxn(record.vat_amount, original_currency, fx_multiplier) if report_components else None
+    tips_mxn = _component_amount_mxn(record.tips, original_currency, fx_multiplier) if report_components else None
     category_en = normalize_expense_category(record.expense_category, f"{record.seller} {record.contents}")
     return {
         "No.": _crop_no_from_link(record.crop_image) or record.line_no,
@@ -2045,8 +2895,19 @@ def _reimbursement_value_map(record: InvoiceRecord, rates: list[ExchangeRate]) -
         "Merchant": record.seller,
         "Detail": record.contents,
         "Accounting Category": category_en,
+        VAT_MXN_HEADER: vat_mxn,
+        TIPS_MXN_HEADER: tips_mxn,
         SYSTEM_NOTE_HEADER: record.remarks,
     }
+
+
+def _component_amount_mxn(amount: float, currency: str, fx_multiplier: float | None) -> float | None:
+    value = round(float(amount or 0), 2)
+    if currency == "MXN":
+        return value
+    if fx_multiplier is None:
+        return None
+    return round(value * fx_multiplier, 2)
 
 
 def _mxn_amount(amount: float, currency: str, rate: ExchangeRate | None) -> tuple[float | None, float | None]:
@@ -2072,9 +2933,12 @@ def _record_from_reimbursement_row(values: list[object]) -> InvoiceRecord:
         contents=str(values[9] or ""),
         currency=currency,
         total_amount=round(mxn_amount if currency == "MXN" or original_amount <= 0 else mxn_amount, 2),
+        vat_amount=_to_float(_row_value(values, VAT_MXN_HEADER)),
+        tips=_to_float(_row_value(values, TIPS_MXN_HEADER)),
         seller=str(values[8] or "Unknown"),
         remarks=str(_row_value(values, SYSTEM_NOTE_HEADER) or ""),
         crop_image=str(_row_value(values, "Invoice link") or ""),
+        report_components=any(_row_value(values, header) not in (None, "") for header in (VAT_MXN_HEADER, TIPS_MXN_HEADER)),
     )
     record.original_currency = currency
     record.original_amount = round(original_amount if original_amount > 0 else mxn_amount, 2)
@@ -2126,6 +2990,36 @@ def _rates_from_workbook(wb) -> list[ExchangeRate]:
     return rates
 
 
+def _exchange_rate_requirements(wb, records: Iterable[InvoiceRecord]) -> tuple[list[date], set[str]]:
+    """Return active invoice dates and foreign currencies represented in a workbook."""
+
+    invoice_dates: list[date] = []
+    fx_currencies: set[str] = set()
+    for record in records:
+        invoice_date = _record_date(record)
+        if invoice_date is not None:
+            invoice_dates.append(invoice_date)
+        currency = _normalize_currency(record.currency)
+        if currency != "MXN":
+            fx_currencies.add(currency)
+
+    ws = _ensure_manual_sheet(wb)
+    if ws is None:
+        return invoice_dates, fx_currencies
+    columns = _header_columns(ws)
+    for row_idx in range(2, ws.max_row + 1):
+        values = _row_values_by_header(ws, row_idx, columns)
+        if _row_is_deleted(ws, row_idx) or not _looks_like_reimbursement_row(values):
+            continue
+        invoice_date = _parse_date(_row_value(values, "Date"))
+        if invoice_date is not None:
+            invoice_dates.append(invoice_date)
+        currency = _normalize_currency(str(_row_value(values, "\u539f\u5e01\u79cd") or "MXN"))
+        if currency != "MXN":
+            fx_currencies.add(currency)
+    return invoice_dates, fx_currencies
+
+
 def _best_rate_for_date(rates: list[ExchangeRate], target: date) -> ExchangeRate | None:
     rate = nearest_rate_on_or_before(rates, target)
     if rate is not None:
@@ -2135,8 +3029,10 @@ def _best_rate_for_date(rates: list[ExchangeRate], target: date) -> ExchangeRate
     return min(rates, key=lambda item: abs((item.rate_date - target).days))
 
 
-def _write_exchange_rate_sheet(wb, rates: list[ExchangeRate]) -> None:
+def _write_exchange_rate_sheet(wb, rates: list[ExchangeRate], replace: bool = False) -> None:
     ws = wb[EXCHANGE_RATE_SHEET] if EXCHANGE_RATE_SHEET in wb.sheetnames else wb.create_sheet(EXCHANGE_RATE_SHEET)
+    if replace and ws.max_row > 1:
+        ws.delete_rows(2, ws.max_row - 1)
     for col, header in enumerate(EXCHANGE_RATE_HEADERS, start=1):
         ws.cell(1, col).value = header
         ws.cell(1, col).font = Font(bold=True)
@@ -2161,6 +3057,38 @@ def _merge_rates(existing: list[ExchangeRate], fetched: list[ExchangeRate]) -> l
     return [by_date[key] for key in sorted(by_date)]
 
 
+def _daily_rate_window(rates: list[ExchangeRate], start_date: date, end_date: date) -> list[ExchangeRate]:
+    daily: list[ExchangeRate] = []
+    if start_date > end_date or not rates:
+        return daily
+    day = start_date
+    while day <= end_date:
+        source = _best_rate_for_date(rates, day)
+        if source is not None:
+            daily.append(
+                ExchangeRate(
+                    rate_date=day,
+                    usd_cny_per_100=source.usd_cny_per_100,
+                    mxn_per_100_cny=source.mxn_per_100_cny,
+                    source_url=source.source_url,
+                    fetched_at=source.fetched_at,
+                    rates=dict(source.rates),
+                )
+            )
+        day += timedelta(days=1)
+    return daily
+
+
+def _rate_table_signature(rates: list[ExchangeRate]) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        (
+            rate.rate_date,
+            *(round(rate.rate_value(code), 8) for code in SAFE_CURRENCY_CODES),
+        )
+        for rate in sorted(rates, key=lambda item: item.rate_date)
+    )
+
+
 def _currency_needs_refresh(existing: list[ExchangeRate], currency: str, needed_start: date, needed_end: date) -> bool:
     code = normalize_safe_currency(currency)
     if code in {"MXN", "CNY", "RMB"}:
@@ -2174,28 +3102,29 @@ def _currency_needs_refresh(existing: list[ExchangeRate], currency: str, needed_
 def _missing_rate_ranges(existing: list[ExchangeRate], needed_start: date, needed_end: date) -> list[tuple[date, date]]:
     if needed_start > needed_end:
         return []
+    lookback_start = needed_start - timedelta(days=10)
     if not existing:
-        return [(needed_start, needed_end)]
+        return [(lookback_start, needed_end)]
     existing_dates = [rate.rate_date for rate in existing]
     ranges: list[tuple[date, date]] = []
     min_existing = min(existing_dates)
     max_existing = max(existing_dates)
-    if needed_start < min_existing:
-        ranges.append((needed_start, min_existing - timedelta(days=1)))
+    if not any(rate.rate_date <= needed_start for rate in existing):
+        ranges.append((lookback_start, min_existing - timedelta(days=1)))
     if needed_end > max_existing:
         ranges.append((max_existing + timedelta(days=1), needed_end))
     return [(start, end) for start, end in ranges if start <= end]
 
 
 def _dedupe_ranges(ranges: list[tuple[date, date]]) -> list[tuple[date, date]]:
-    deduped: list[tuple[date, date]] = []
-    seen: set[tuple[date, date]] = set()
-    for item in ranges:
-        if item in seen:
+    merged: list[tuple[date, date]] = []
+    for start, end in sorted(set(ranges)):
+        if not merged or start > merged[-1][1] + timedelta(days=1):
+            merged.append((start, end))
             continue
-        seen.add(item)
-        deduped.append(item)
-    return deduped
+        previous_start, previous_end = merged[-1]
+        merged[-1] = (previous_start, max(previous_end, end))
+    return merged
 
 
 def _protected_record_keys(ws, rates: list[ExchangeRate]) -> set[tuple[str, str, float]]:
@@ -2240,6 +3169,10 @@ def _format_row(ws, row: int, columns: dict[str, int]) -> None:
         ws.cell(row, columns["Date"]).number_format = "yyyy-mm-dd"
     if columns.get("MXN Amount"):
         ws.cell(row, columns["MXN Amount"]).number_format = "#,##0.00"
+    if columns.get(VAT_MXN_HEADER):
+        ws.cell(row, columns[VAT_MXN_HEADER]).number_format = "#,##0.00"
+    if columns.get(TIPS_MXN_HEADER):
+        ws.cell(row, columns[TIPS_MXN_HEADER]).number_format = "#,##0.00"
     if columns.get("\u539f\u91d1\u989d"):
         ws.cell(row, columns["\u539f\u91d1\u989d"]).number_format = "#,##0.00"
     if columns.get("\u6c47\u7387"):

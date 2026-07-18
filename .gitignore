@@ -4,6 +4,7 @@
 # Python cache/test artifacts
 __pycache__/
 *.py[cod]
+.venv/
 .pytest_cache/
 .mypy_cache/
 
@@ -11,6 +12,7 @@ __pycache__/
 data/*
 !data/samples/
 !data/samples/synthetic_receipt.jpg
+project_media_jpg/
 
 # Real reimbursement workbooks/archives generated during operations
 *.xlsx

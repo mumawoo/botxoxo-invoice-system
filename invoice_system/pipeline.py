@@ -3,26 +3,26 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from copy import deepcopy
 from dataclasses import asdict
 from datetime import date, datetime
 from hashlib import sha256
 from pathlib import Path
 
+from .codex_scan import partial_record_from_response_text
 from .config import Settings
 from .dual_ocr import DualOCRResolver, ResolvedScan
 from .expense_categories import normalize_expense_category
 from .image_splitter import OpenCVInvoiceSplitter, iter_images
 from .models import CropResult, InvoiceRecord, OCRAuditRow, OCRResult, PipelineSummary, SourceQARecord
-from .pairing import pair_invoice_payment_slips
-from .quality import should_delete_failed_crop
+from .parsing import normalize_date
+from .quality import is_obvious_background_crop, should_delete_failed_crop
 from .qwen_scan import QwenScanRecognizer
 from .reimbursement_excel import (
-    ReimbursementWorkbook,
-    assign_available_line_numbers,
     clear_generated_crops,
     next_manual_trace_id,
+    rebuild_scan_output,
     reimbursement_workbook_path,
+    sync_source_to_review,
 )
 from .visual_count import AIVisualCounter, VisualCountResult
 
@@ -80,7 +80,6 @@ class InvoicePipeline:
                         state_path,
                         _PipelineState(completed, crop_count, records, audits, source_qas, source_hashes, next_crop_id),
                     )
-                    self._write_outputs(records, audits, source_qas)
                 continue
             crops = splitter.split(image)
             visual_count = self._visual_count_for_image(image, len(crops))
@@ -88,6 +87,17 @@ class InvoicePipeline:
             image_audits: list[OCRAuditRow] = []
             for crop in crops:
                 crop_count += 1
+                if is_obvious_background_crop(crop.crop_path):
+                    image_audits.append(
+                        OCRAuditRow(
+                            source_image=str(crop.source_path),
+                            crop_image=str(crop.crop_path),
+                            decision="pre-Qwen background noise filtered; crop deleted",
+                            used_codex=False,
+                        )
+                    )
+                    _delete_file(crop.crop_path)
+                    continue
                 resolved = self.resolver.scan(crop.crop_path)
                 record = resolved.record
                 record.source_image = str(crop.source_path)
@@ -123,11 +133,20 @@ class InvoicePipeline:
                         codex_text=codex.text if codex else "",
                     )
                 )
-            _fill_missing_dates_from_neighbors(image_records)
+            _fill_missing_dates_from_neighbors(records + image_records, targets=image_records)
             _rename_valid_crops(image_records, image_audits)
             records.extend(image_records)
             audits.extend(image_audits)
-            source_qas.append(_source_qa_record(image, visual_count, len(crops), len(image_records)))
+            failed_crop_count = sum(1 for audit in image_audits if audit.codex_error)
+            source_qas.append(
+                _source_qa_record(
+                    image,
+                    visual_count,
+                    len(crops),
+                    len(image_records),
+                    failed_crop_count=failed_crop_count,
+                )
+            )
             completed.add(image_key)
             if image_hash:
                 source_hashes.add(image_hash)
@@ -136,12 +155,11 @@ class InvoicePipeline:
                     state_path,
                     _PipelineState(completed, crop_count, records, audits, source_qas, source_hashes, next_crop_id),
                 )
-                self._write_outputs(records, audits, source_qas)
-
-        written, workbook_path = self._write_outputs(records, audits, source_qas)
+                self._write_outputs(records, [image])
         if resume:
             _save_state(state_path, _PipelineState(completed, crop_count, records, audits, source_qas, source_hashes, next_crop_id))
-        return PipelineSummary(len(source_images), crop_count, written, workbook_path)
+        written, workbook_path, review_warnings = self._write_outputs(records, source_images)
+        return PipelineSummary(len(source_images), crop_count, written, workbook_path, review_warnings)
 
     def _visual_count_for_image(self, image: Path, opencv_crop_count: int) -> VisualCountResult:
         threshold = max(self.settings.ai_visual_count_min_opencv_crops, 1)
@@ -155,16 +173,29 @@ class InvoicePipeline:
     def _write_outputs(
         self,
         records: list[InvoiceRecord],
-        audits: list[OCRAuditRow],
-        source_qas: list[SourceQARecord],
-    ) -> tuple[int, Path]:
-        store = ReimbursementWorkbook(reimbursement_workbook_path(self.output_dir))
-        _fill_missing_dates_from_neighbors(records)
-        output_records = pair_invoice_payment_slips(deepcopy(records), mode=self.settings.pairing_mode)
-        output_records = store.unlocked_records(output_records)
-        assign_available_line_numbers(output_records, store.locked_numbers())
-        result = store.write_records(output_records)
-        return result.rows_written, result.workbook_path
+        source_images: list[Path],
+    ) -> tuple[int, Path, tuple[str, ...]]:
+        rebuild_scan_output(self.output_dir, records, pairing_mode=self.settings.pairing_mode)
+        affected_ids: set[str] = set()
+        warnings: list[str] = []
+        review_path = reimbursement_workbook_path(self.output_dir)
+        for source in source_images:
+            source_key = _source_key(source).casefold()
+            source_records = [record for record in records if _source_key(Path(record.source_image)).casefold() == source_key]
+            result = sync_source_to_review(
+                self.output_dir,
+                source,
+                source_records,
+                records,
+                pairing_mode=self.settings.pairing_mode,
+            )
+            affected_ids.update(
+                _trace_id
+                for record in result.affected_records
+                if (_trace_id := _record_trace_id(record))
+            )
+            warnings.extend(result.warnings)
+        return len(affected_ids), review_path, tuple(dict.fromkeys(warnings))
 
 
 class _PipelineState:
@@ -191,11 +222,20 @@ def _empty_state() -> _PipelineState:
     return _PipelineState(set(), 0, [], [], [], set(), SEQUENCE_START)
 
 
+def load_processing_records(output_dir: Path) -> list[InvoiceRecord]:
+    return list(_load_state(output_dir / "processing_state.json").records)
+
+
 def _source_key(path: Path) -> str:
     try:
         return str(path.resolve())
     except OSError:
         return str(path)
+
+
+def _record_trace_id(record: InvoiceRecord) -> str:
+    match = re.match(r"(\d{3,})", Path(str(record.crop_image or "")).name)
+    return match.group(1) if match else ""
 
 
 def _load_state(path: Path) -> _PipelineState:
@@ -259,6 +299,7 @@ def _source_qa_record(
     visual_count: VisualCountResult,
     opencv_crop_count: int,
     final_invoice_rows: int,
+    failed_crop_count: int = 0,
 ) -> SourceQARecord:
     needs_review = False
     reasons: list[str] = []
@@ -278,6 +319,9 @@ def _source_qa_record(
     if final_invoice_rows == 0 and opencv_crop_count > 0:
         needs_review = True
         reasons.append("OpenCV crops produced no invoice rows")
+    if failed_crop_count:
+        needs_review = True
+        reasons.append(f"Qwen validation failed for {failed_crop_count} crop(s)")
 
     return SourceQARecord(
         source_image=str(image),
@@ -380,27 +424,51 @@ def _crop_batch_date(image: Path) -> str:
         return date.today().isoformat()
 
 
-def _fill_missing_dates_from_neighbors(records: list[InvoiceRecord]) -> None:
-    dated_indexes = [index for index, record in enumerate(records) if record.invoice_date.strip()]
-    if not dated_indexes:
-        for record in records:
-            fallback_date = _record_source_date(record)
-            if not fallback_date:
-                continue
-            record.invoice_date = fallback_date
-            note = "Missing date filled from source photo date"
-            record.remarks = f"{record.remarks}; {note}" if record.remarks else note
-        return
+def _fill_missing_dates_from_neighbors(
+    records: list[InvoiceRecord], targets: list[InvoiceRecord] | None = None
+) -> None:
+    """Infer dates for new undated records without changing historical rows."""
+
+    target_ids = {id(record) for record in (targets if targets is not None else records)}
     for index, record in enumerate(records):
-        if record.invoice_date.strip():
+        if id(record) not in target_ids or normalize_date(record.invoice_date):
             continue
-        nearest = min(dated_indexes, key=lambda dated_index: (abs(dated_index - index), dated_index > index))
-        neighbor_date = records[nearest].invoice_date.strip()
-        if not neighbor_date:
+
+        source_key = str(record.source_image or "").strip()
+        same_source_dates = {
+            normalize_date(candidate.invoice_date)
+            for candidate in records
+            if candidate is not record
+            and source_key
+            and str(candidate.source_image or "").strip() == source_key
+            and normalize_date(candidate.invoice_date)
+        }
+        if len(same_source_dates) == 1:
+            inferred = next(iter(same_source_dates))
+            record.invoice_date = inferred
+            _append_record_remark(record, f"Missing date filled from same photo: {inferred}")
             continue
-        record.invoice_date = neighbor_date
-        note = "Missing date filled from nearby receipt"
-        record.remarks = f"{record.remarks}; {note}" if record.remarks else note
+
+        nearby: list[tuple[int, str]] = []
+        for candidate_index, candidate in enumerate(records):
+            distance = abs(candidate_index - index)
+            candidate_date = normalize_date(candidate.invoice_date)
+            if candidate is record or distance == 0 or distance > 3 or not candidate_date:
+                continue
+            nearby.append((distance, candidate_date))
+        if not nearby:
+            continue
+        minimum_distance = min(distance for distance, _ in nearby)
+        nearest_dates = {candidate_date for distance, candidate_date in nearby if distance == minimum_distance}
+        if len(nearest_dates) != 1:
+            continue
+        inferred = next(iter(nearest_dates))
+        record.invoice_date = inferred
+        _append_record_remark(record, f"Missing date filled from nearby batch receipt: {inferred}")
+
+
+def _append_record_remark(record: InvoiceRecord, remark: str) -> None:
+    record.remarks = f"{record.remarks}; {remark}" if record.remarks else remark
 
 
 def _record_source_date(record: InvoiceRecord) -> str:
@@ -455,6 +523,21 @@ class QwenOnlyResolver:
             if orientation_note:
                 reason = f"{reason}; {orientation_note}"
             return ResolvedScan(record, empty, empty, result, True, reason)
+        if result.text:
+            try:
+                record = partial_record_from_response_text(result.text)
+            except Exception:
+                record = None
+            if record is not None and (record.total_amount > 0 or record.seller != "Unknown"):
+                record.expense_category = normalize_expense_category(
+                    record.expense_category,
+                    f"{record.seller} {record.contents}",
+                    company_profile=self.qwen.settings.company_profile,
+                    root=self.qwen.settings.root,
+                )
+                warning = f"Qwen partial result retained: {result.error}; needs human review"
+                record.remarks = f"{record.remarks}; {warning}" if record.remarks else warning
+                return ResolvedScan(record, empty, empty, result, True, "qwen partial result; needs human review")
         record = InvoiceRecord(remarks=f"Qwen Scan failed: {result.error}; needs human review")
         return ResolvedScan(record, empty, empty, result, False, "qwen scan failed")
 
@@ -473,9 +556,11 @@ def _apply_qwen_orientation(image_path: Path, result: OCRResult) -> str:
 
         with Image.open(image_path) as image:
             image = ImageOps.exif_transpose(image).convert("RGB")
-            image = image.rotate(rotation, expand=True)
+            # Pillow uses positive angles for counterclockwise rotation. Qwen,
+            # Tesseract, and OpenCV all report the clockwise correction needed.
+            image = image.rotate(-rotation, expand=True)
             image.save(image_path, quality=98)
-        return f"qwen rotated crop {rotation}deg {confidence:.2f}"
+        return f"qwen rotated crop {rotation}deg clockwise {confidence:.2f}"
     except Exception as exc:
         result.error = f"{result.error}; orientation rotate failed: {exc}" if result.error else f"orientation rotate failed: {exc}"
         return f"qwen orientation rotate failed {rotation}deg"

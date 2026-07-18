@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from unittest.mock import AsyncMock, patch
 from datetime import date, datetime
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from invoice_system.telegram_bot import (
     append_process_status,
     change_message,
     delete_message,
+    download_telegram_media,
     format_telegram_config,
     group_message,
     is_allowed_user,
@@ -47,6 +49,7 @@ from invoice_system.telegram_bot import (
     whoami_message,
     is_supported_telegram_image_document,
     _acquire_telegram_instance_lock,
+    _photo_quality_warning,
     _release_telegram_instance_lock,
 )
 
@@ -114,6 +117,16 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn("Photo ingestion: READY", text)
         self.assertIn("Status: READY", text)
 
+    def test_format_telegram_config_reports_missing_opencv_splitter(self):
+        settings = Settings(telegram_bot_token="token", telegram_allowed_user_ids=frozenset({123}))
+        with patch("invoice_system.telegram_bot.missing_photo_processing_packages", return_value=("cv2",)):
+            text = format_telegram_config(settings)
+
+            self.assertFalse(telegram_config_ready(settings))
+            self.assertIn("OpenCV splitter: MISSING", text)
+            self.assertIn("Photo ingestion: NOT READY", text)
+            self.assertIn("opencv-python", text)
+
     def test_format_telegram_config_warns_when_company_profile_is_missing(self):
         with tempfile.TemporaryDirectory() as temp:
             text = format_telegram_config(Settings(root=Path(temp), company_profile="missing-profile"))
@@ -158,6 +171,7 @@ class TelegramBotTests(unittest.TestCase):
         text = telegram_help_message()
 
         self.assertIn("/status", text)
+        self.assertIn("tap SD in preview → HD", text)
         self.assertIn("/restart", text)
         self.assertIn("/excel", text)
         self.assertIn("/checked", text)
@@ -172,6 +186,18 @@ class TelegramBotTests(unittest.TestCase):
         self.assertIn("/change 021 other", text)
         self.assertNotIn("/today_excel -", text)
         self.assertIn("/submit", text)
+
+    def test_help_message_explains_hd_camera_in_chinese(self):
+        self.assertIn("预览页点 SD → HD", telegram_help_message("zh"))
+
+    def test_sd_four_receipts_warns_but_sd_three_and_hd_four_do_not(self):
+        sd_four = QueueItem(path="sd-four.jpg", upload_quality="sd", image_width=960, image_height=1280, detected_receipt_count=4)
+        sd_three = QueueItem(path="sd-three.jpg", upload_quality="sd", image_width=960, image_height=1280, detected_receipt_count=3)
+        hd_four = QueueItem(path="hd-four.jpg", upload_quality="hd", image_width=1920, image_height=2560, detected_receipt_count=4)
+
+        self.assertIn("SD→HD", _photo_quality_warning(sd_four, "zh"))
+        self.assertEqual(_photo_quality_warning(sd_three, "zh"), "")
+        self.assertEqual(_photo_quality_warning(hd_four, "zh"), "")
 
     def test_chinese_help_and_language_preference(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -407,6 +433,41 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn("- Food: 150.00", text)
             self.assertIn("Queue", text)
             self.assertIn("Review: /excel", text)
+
+    def test_scan_completion_message_explains_automatic_payment_pairing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = Settings(
+                root=root,
+                inbound_dir=root / "data" / "inbound",
+                trial_dir=root / "data" / "trial",
+                output_dir=root / "data" / "output",
+                baseline_dir=root / "data" / "baseline",
+                telegram_allowed_user_ids=frozenset({123}),
+            )
+            record = InvoiceRecord(
+                line_no=37,
+                invoice_date="2026-05-16",
+                expense_category="Food",
+                seller="Las Palmas",
+                total_amount=616.40,
+                tips=80.40,
+                crop_image=str(root / "crops" / "037_2026-05-16_MXN_536.00_Las_Palmas.jpg"),
+                supporting_crop_images=[str(root / "crops" / "163_2026-05-16_MXN_616.40_Las_Palmas.jpg")],
+                remarks="Combined payment slip; tips calculated as 80.40; supporting crop 163 kept",
+            )
+            ReimbursementWorkbook(telegram_user_workbook(settings, 123)).write_records([record])
+            photo = root / "photo.jpg"
+            photo.write_bytes(b"jpg")
+            item = QueueItem(path=str(photo), status=DONE, row_count=1, total_amount=616.40)
+            save_queue_state(telegram_user_queue_path(settings, 123), QueueState([item]))
+
+            text = scan_completion_message(settings, 123, item, [record])
+
+            self.assertIn("Automatic pairing:", text)
+            self.assertIn("163 merged into 037", text)
+            self.assertIn("payment includes tips 80.40", text)
+            self.assertIn("will not be reused", text)
 
     def test_change_message_edits_manual_workbook_by_crop_id(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -950,6 +1011,28 @@ class TelegramBotTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertIn("cancelled", text)
+
+
+class TelegramDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_download_retries_transient_timeout_then_succeeds(self):
+        timed_out = type("TimedOut", (Exception,), {})
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "photo.jpg"
+            telegram_file = type("TelegramFile", (), {})()
+
+            async def save_file(custom_path):
+                Path(custom_path).write_bytes(b"photo")
+
+            telegram_file.download_to_drive = AsyncMock(side_effect=save_file)
+            bot = type("Bot", (), {})()
+            bot.get_file = AsyncMock(side_effect=[timed_out("network timeout"), telegram_file])
+
+            with patch("invoice_system.telegram_bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                await download_telegram_media(bot, "file-id", target)
+
+            self.assertEqual(bot.get_file.await_count, 2)
+            sleep.assert_awaited_once()
+            self.assertEqual(target.read_bytes(), b"photo")
 
 
 if __name__ == "__main__":

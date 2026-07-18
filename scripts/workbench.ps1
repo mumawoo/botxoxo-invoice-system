@@ -5,6 +5,9 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
 $EnvFile = Join-Path $ProjectRoot ".env"
+$ProjectVenv = Join-Path $ProjectRoot ".venv"
+$ProjectPython = Join-Path $ProjectVenv "Scripts\python.exe"
+$UseExplicitPython = [bool]($env:INVOICE_SYSTEM_PYTHON -and (Test-Path -LiteralPath $env:INVOICE_SYSTEM_PYTHON))
 
 function Get-DotEnvValue {
     param([string]$Name)
@@ -20,8 +23,11 @@ function Get-DotEnvValue {
 }
 
 function Get-DefaultPython {
-    if ($env:INVOICE_SYSTEM_PYTHON -and (Test-Path -LiteralPath $env:INVOICE_SYSTEM_PYTHON)) {
+    if ($UseExplicitPython) {
         return $env:INVOICE_SYSTEM_PYTHON
+    }
+    if (Test-Path -LiteralPath $ProjectPython) {
+        return $ProjectPython
     }
     $codexPython = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
     if (Test-Path -LiteralPath $codexPython) {
@@ -70,15 +76,22 @@ $ProjectLabel.AutoSize = $true
 $ProjectLabel.Location = New-Object System.Drawing.Point(20, 52)
 $Form.Controls.Add($ProjectLabel)
 
+$RuntimeLabel = New-Object System.Windows.Forms.Label
+$RuntimeLabel.Text = "Runtime: $Python"
+$RuntimeLabel.AutoSize = $true
+$RuntimeLabel.Location = New-Object System.Drawing.Point(20, 73)
+$RuntimeLabel.ForeColor = [System.Drawing.Color]::FromArgb(75, 85, 99)
+$Form.Controls.Add($RuntimeLabel)
+
 $UserLabel = New-Object System.Windows.Forms.Label
 $UserLabel.Text = "Telegram user ID:"
 $UserLabel.AutoSize = $true
-$UserLabel.Location = New-Object System.Drawing.Point(20, 86)
+$UserLabel.Location = New-Object System.Drawing.Point(20, 106)
 $Form.Controls.Add($UserLabel)
 
 $UserBox = New-Object System.Windows.Forms.TextBox
 $UserBox.Text = $DefaultUserId
-$UserBox.Location = New-Object System.Drawing.Point(150, 82)
+$UserBox.Location = New-Object System.Drawing.Point(150, 102)
 $UserBox.Size = New-Object System.Drawing.Size(180, 28)
 $Form.Controls.Add($UserBox)
 
@@ -120,38 +133,106 @@ function Start-InvoiceCommand {
     $Status.Text = "Started: $Title"
 }
 
-function Assert-TelegramDependency {
+function Get-MissingPythonModules {
+    param([string[]]$Modules)
+    $moduleCsv = $Modules -join ","
+    $code = "import importlib.util; names='$moduleCsv'.split(','); print(','.join(n for n in names if importlib.util.find_spec(n) is None))"
     try {
-        & $Python -c "import telegram; raise SystemExit(0)" *> $null
-        if ($LASTEXITCODE -eq 0) {
-            return $true
+        $output = (& $Python -c $code 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0) {
+            return @($Modules)
         }
     } catch {
+        return @($Modules)
     }
+    if (-not $output) {
+        return @()
+    }
+    return @($output -split "," | Where-Object { $_ })
+}
+
+function Ensure-ProjectRuntime {
+    if ($UseExplicitPython) {
+        return $true
+    }
+    if (Test-Path -LiteralPath $ProjectPython) {
+        $script:Python = $ProjectPython
+        $RuntimeLabel.Text = "Runtime: $ProjectPython"
+        return $true
+    }
+
+    $bootstrapPython = $Python
+    $Status.Text = "Creating stable project runtime at $ProjectVenv ..."
+    try {
+        & $bootstrapPython -m venv $ProjectVenv
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $ProjectPython)) {
+            throw "Python venv creation failed."
+        }
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Could not create the stable project runtime:`n$ProjectVenv`n`n$($_.Exception.Message)",
+            "Runtime setup failed",
+            "OK",
+            "Error"
+        ) | Out-Null
+        $Status.Text = "Runtime setup failed."
+        return $false
+    }
+    $script:Python = $ProjectPython
+    $RuntimeLabel.Text = "Runtime: $ProjectPython"
+    $Status.Text = "Stable project runtime created. Checking packages..."
+    return $true
+}
+
+function Start-DependencyInstall {
+    param([string[]]$MissingModules)
+    $packageMap = @{
+        "telegram" = "python-telegram-bot>=22.0"
+        "cv2" = "opencv-python>=4.9.0"
+        "PIL" = "Pillow>=10.0.0"
+        "numpy" = "numpy>=1.24,<2.4"
+        "openpyxl" = "openpyxl>=3.1.0"
+    }
+    $packages = @($MissingModules | ForEach-Object { $packageMap[$_] } | Where-Object { $_ } | Select-Object -Unique)
+    $missingText = $MissingModules -join ", "
     $answer = [System.Windows.Forms.MessageBox]::Show(
-        "Telegram dependency is missing in this Python runtime.`n`nInstall python-telegram-bot now?",
-        "Telegram dependency missing",
+        "Required modules are missing from the Python used by Workbench:`n$missingText`n`nInstall them now?",
+        "Invoice runtime incomplete",
         "YesNo",
         "Question"
     )
     if ($answer -ne "Yes") {
-        $Status.Text = "Telegram dependency missing. Install python-telegram-bot."
+        $Status.Text = "Cannot start. Missing: $missingText"
         return $false
     }
-    $installCommand = "& " + (ConvertTo-CommandLiteral $Python) + " -m pip install `"python-telegram-bot>=22.0`"; if (`$LASTEXITCODE -eq 0) { Write-Host 'Telegram dependency installed. You can close this window.' } else { Write-Host 'Install failed. Keep this window open and check the error.' }"
-    $process = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-ExecutionPolicy", "Bypass", "-Command", $installCommand) -WindowStyle Normal -PassThru
-    $process.WaitForExit()
-    try {
-        & $Python -c "import telegram; raise SystemExit(0)" *> $null
-        if ($LASTEXITCODE -eq 0) {
-            $Status.Text = "Telegram dependency installed."
-            return $true
-        }
-    } catch {
-    }
-    [System.Windows.Forms.MessageBox]::Show("Telegram dependency install did not complete. Check the install window.", "Install failed", "OK", "Warning") | Out-Null
-    $Status.Text = "Telegram dependency install failed."
+    $pythonLiteral = ConvertTo-CommandLiteral $Python
+    $packageText = ($packages | ForEach-Object { ConvertTo-CommandLiteral $_ }) -join " "
+    $installCommand = "& $pythonLiteral -m pip install $packageText; if (`$LASTEXITCODE -eq 0) { Write-Host 'Invoice runtime dependencies installed.' -ForegroundColor Green; Start-Sleep -Seconds 3; exit 0 } else { Write-Host 'Install failed. Keep this window open and check the error.' -ForegroundColor Red }"
+    Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoExit", "-ExecutionPolicy", "Bypass", "-Command", $installCommand) -WindowStyle Normal | Out-Null
+    $Status.Text = "Installing missing modules: $missingText. Click Start again after the install window closes."
     return $false
+}
+
+function Assert-TelegramDependency {
+    if (-not (Ensure-ProjectRuntime)) {
+        return $false
+    }
+    $missing = @(Get-MissingPythonModules -Modules @("telegram"))
+    if ($missing.Count -eq 0) {
+        return $true
+    }
+    return Start-DependencyInstall -MissingModules $missing
+}
+
+function Assert-ProcessingDependencies {
+    if (-not (Ensure-ProjectRuntime)) {
+        return $false
+    }
+    $missing = @(Get-MissingPythonModules -Modules @("telegram", "cv2", "PIL", "numpy", "openpyxl"))
+    if ($missing.Count -eq 0) {
+        return $true
+    }
+    return Start-DependencyInstall -MissingModules $missing
 }
 
 function Open-Path {
@@ -381,8 +462,8 @@ function Add-Button {
 }
 
 $Tabs = New-Object System.Windows.Forms.TabControl
-$Tabs.Location = New-Object System.Drawing.Point(20, 130)
-$Tabs.Size = New-Object System.Drawing.Size(800, 380)
+$Tabs.Location = New-Object System.Drawing.Point(20, 145)
+$Tabs.Size = New-Object System.Drawing.Size(800, 365)
 $Tabs.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 $Form.Controls.Add($Tabs)
 
@@ -393,7 +474,7 @@ $AdvancedTab = New-WorkbenchTab "Advanced"
 
 Add-Section "Telegram bot" 20 20 $DailyTab
 Add-Button "Start / Restart Auto Scan" 20 55 {
-    if (Assert-TelegramDependency) {
+    if (Assert-ProcessingDependencies) {
         Start-InvoiceCommand -Title "Telegram bot auto scan" -InvoiceArgs @("telegram", "--process") -RestartExisting
     }
 } "Stops old invoice_system PIDs if any, then starts polling with auto scan." $DailyTab 235 "Primary"

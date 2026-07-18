@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import re
 import errno
@@ -32,6 +33,7 @@ from .queue_worker import (
     rollback_last_photo,
     start_background_worker,
     summarize_queue,
+    telegram_photo_quality,
     telegram_user_day_dir,
     telegram_user_output_dir,
     telegram_user_queue_path,
@@ -57,6 +59,44 @@ LANG_EN = "en"
 LANG_ZH = "zh"
 LANG_CHOICES = {LANG_EN, LANG_ZH, "cn", "chinese", "english", "中文", "英文"}
 PREFERENCES_FILE = "telegram_preferences.json"
+LOGGER = logging.getLogger(__name__)
+TELEGRAM_DOWNLOAD_RETRY_DELAYS = (1.0, 3.0)
+
+
+async def download_telegram_media(bot, file_id: str, target: Path) -> None:
+    """Download Telegram media with bounded retries for transient network errors."""
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    attempts = len(TELEGRAM_DOWNLOAD_RETRY_DELAYS) + 1
+    for attempt in range(attempts):
+        try:
+            telegram_file = await bot.get_file(file_id)
+            await telegram_file.download_to_drive(custom_path=Path(target))
+            return
+        except Exception as exc:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if attempt >= attempts - 1 or not _is_retryable_telegram_download_error(exc):
+                raise
+            await asyncio.sleep(TELEGRAM_DOWNLOAD_RETRY_DELAYS[attempt])
+
+
+def _is_retryable_telegram_download_error(exc: Exception) -> bool:
+    retryable_names = {
+        "ConnectError",
+        "ConnectTimeout",
+        "NetworkError",
+        "PoolTimeout",
+        "ReadError",
+        "ReadTimeout",
+        "RetryAfter",
+        "TimedOut",
+        "WriteError",
+        "WriteTimeout",
+    }
+    return any(base.__name__ in retryable_names for base in type(exc).__mro__)
 
 
 def normalize_telegram_language(value: str | None) -> str:
@@ -132,6 +172,22 @@ def processing_failure_message(path: Path, exc: Exception, lang: str = LANG_EN) 
     return f"Saved photo\nProcessing failed: {detail}"
 
 
+def _photo_quality_warning(item: QueueItem, lang: str = LANG_EN) -> str:
+    if str(item.upload_quality or "").casefold() != "sd" or int(item.detected_receipt_count or 0) < 4:
+        return ""
+    dimensions = f"{int(item.image_width or 0)}×{int(item.image_height or 0)}"
+    count = int(item.detected_receipt_count or 0)
+    if is_zh(lang):
+        return (
+            f"清晰度提醒：本图为 {dimensions}，共检测到 {count} 张票。"
+            "下次请在发送前点 SD→HD。本次已继续扫描，请用 /crops 抽查。"
+        )
+    return (
+        f"Quality reminder: this photo is {dimensions} with {count} detected receipts. "
+        "Next time tap SD→HD before sending. This scan continued; use /crops to review."
+    )
+
+
 def scan_completion_message(settings: Settings, user_id: int, item: QueueItem, records: list[InvoiceRecord], lang: str = LANG_EN) -> str:
     if item.status == FAILED_RETRYABLE:
         if is_zh(lang):
@@ -160,9 +216,26 @@ def scan_completion_message(settings: Settings, user_id: int, item: QueueItem, r
             "Crops:",
         ]
     lines.extend(_format_scan_record_lines(records))
+    pairing_notices = _format_pairing_notices(records, lang)
+    if pairing_notices:
+        lines.extend(["", "自动合并：" if is_zh(lang) else "Automatic pairing:"])
+        lines.extend(pairing_notices)
     if original_totals:
         lines.append("原币种合计：" if is_zh(lang) else "Original totals:")
         lines.extend(_format_currency_lines(original_totals))
+    quality_warning = _photo_quality_warning(item, lang)
+    if quality_warning:
+        lines.extend(["", quality_warning])
+    if item.needs_human_review:
+        match = re.search(r"Qwen validation failed for (\d+) crop", item.error or "", flags=re.IGNORECASE)
+        count = int(match.group(1)) if match else 0
+        if is_zh(lang):
+            warning = f"有 {count} 张票的金额或商户没有识别完整，请用 /crops 查看。" if count else "本次有内容需要人工检查，请用 /crops 查看。"
+        else:
+            warning = f"{count} receipt(s) have an incomplete amount or merchant. Review with /crops." if count else "This scan needs review. Use /crops."
+        lines.extend(["", warning])
+        if item.error and not match:
+            lines.append(("复核原因：" if is_zh(lang) else "Review reason: ") + item.error)
     if is_zh(lang):
         lines.extend(["", "今天合计", f"行数：{today.record_count}", f"MXN 总额：{today.total_amount:.2f}"])
         lines.extend(_format_category_block(today.category_totals, lang))
@@ -206,11 +279,16 @@ def telegram_polling_ready(settings: Settings) -> bool:
 
 
 def telegram_config_ready(settings: Settings) -> bool:
-    return telegram_polling_ready(settings) and bool(settings.telegram_allowed_user_ids)
+    return telegram_polling_ready(settings) and bool(settings.telegram_allowed_user_ids) and not missing_photo_processing_packages()
 
 
 def telegram_package_ready() -> bool:
     return importlib.util.find_spec("telegram") is not None and importlib.util.find_spec("telegram.ext") is not None
+
+
+def missing_photo_processing_packages() -> tuple[str, ...]:
+    modules = ("cv2", "PIL", "numpy", "openpyxl")
+    return tuple(name for name in modules if importlib.util.find_spec(name) is None)
 
 
 def telegram_start_message(settings: Settings, lang: str = LANG_EN) -> str:
@@ -228,6 +306,12 @@ def telegram_help_message(lang: str = LANG_EN) -> str:
     lines = [title, *[f"/{command} - {description}" for command, description in telegram_command_menu(lang)]]
     lines.extend(
         [
+            "",
+            (
+                "高清拍照：回形针/相机 → 拍照 → 预览页点 SD → HD → 发送。"
+                if is_zh(lang)
+                else "HD photo: paperclip/camera → take photo → tap SD in preview → HD → send."
+            ),
             "",
             "Available type/category values:",
             ", ".join(EXPENSE_CATEGORIES),
@@ -518,6 +602,53 @@ def delete_message(settings: Settings, user_id: int, args: list[str], lang: str 
     return "\n".join(lines)
 
 
+def _format_pairing_notices(records: list[InvoiceRecord], lang: str) -> list[str]:
+    notices: list[str] = []
+    for record in records:
+        remarks = str(record.remarks or "")
+        protected_match = re.search(
+            r"Possible (pair|duplicate) with protected crop (\d{3,})(?:: ([^;]+))?",
+            remarks,
+            flags=re.IGNORECASE,
+        )
+        if protected_match:
+            match_type = protected_match.group(1).casefold()
+            protected_id = protected_match.group(2)
+            detail = str(protected_match.group(3) or "").strip()
+            current_id = _crop_id_from_record(record) or str(record.line_no).zfill(3)
+            if is_zh(lang):
+                label = "可能需要合并" if match_type == "pair" else "可能重复"
+                suffix = f"；{detail}" if detail else ""
+                notices.append(f"- {current_id} 与已人工保护的 {protected_id} {label}{suffix}。旧记录未修改，请人工确认。")
+            else:
+                label = "may need combining" if match_type == "pair" else "may be a duplicate"
+                suffix = f"; {detail}" if detail else ""
+                notices.append(
+                    f"- {current_id} {label} with manually protected {protected_id}{suffix}. "
+                    "The old record was not changed; please review."
+                )
+            continue
+        support_match = re.search(r"supporting crop (\d{3,}) kept", remarks, flags=re.IGNORECASE)
+        if support_match is None:
+            support_match = re.search(r"Combined payment slip (\d{3,})", remarks, flags=re.IGNORECASE)
+        if not support_match or "Combined payment slip" not in remarks:
+            continue
+        primary_id = _crop_id_from_record(record) or str(record.line_no).zfill(3)
+        support_id = support_match.group(1)
+        tip_match = re.search(r"tips calculated as ([0-9]+(?:\.[0-9]+)?)", remarks, flags=re.IGNORECASE)
+        tip = float(tip_match.group(1)) if tip_match else float(record.tips or 0)
+        if is_zh(lang):
+            notices.append(
+                f"- {support_id} 合并到 {primary_id}：日期、商户和币种一致，付款票包含小费 {tip:.2f}；{support_id} 保留且不会复用。"
+            )
+        else:
+            notices.append(
+                f"- {support_id} merged into {primary_id}: same date, merchant and currency; payment includes tips {tip:.2f}. "
+                f"Trace ID {support_id} is kept and will not be reused."
+            )
+    return notices
+
+
 
 def group_message(settings: Settings, user_id: int, args: list[str], lang: str = LANG_EN) -> str:
     output_dir = telegram_user_output_dir(settings, user_id)
@@ -745,9 +876,11 @@ def _parse_change_args(args: list[str]) -> dict[str, object]:
     category: str | None = None
     amount: float | None = None
     currency: str | None = None
+    vat_amount: float | None = None
+    tips: float | None = None
     comment: str | None = None
     tokens = args[1:]
-    keys = {"date", "day", "invoice_date", "type", "category", "cat", "amount", "amt", "currency", "cur"}
+    keys = {"date", "day", "invoice_date", "type", "category", "cat", "amount", "amt", "currency", "cur", "vat", "iva", "tip", "tips"}
     statuses = {"ok", "correct", "corrected"}
     index = 0
     saw_change = False
@@ -796,6 +929,10 @@ def _parse_change_args(args: list[str]) -> dict[str, object]:
             raise ValueError(f"Missing value after {token}")
         value = " ".join(value_parts)
         if token in {"date", "day", "invoice_date"}:
+            if value.casefold() in {"blank", "clear", "none", "empty"}:
+                invoice_date = ""
+                saw_change = True
+                continue
             normalized_date = _normalize_change_date(value)
             if not normalized_date:
                 raise ValueError(f"Invalid date: {value}")
@@ -809,6 +946,16 @@ def _parse_change_args(args: list[str]) -> dict[str, object]:
                 raise ValueError(f"Invalid amount: {value}") from exc
         elif token in {"currency", "cur"}:
             currency = value.upper()
+        elif token in {"vat", "iva"}:
+            try:
+                vat_amount = float(value.replace(",", ""))
+            except ValueError as exc:
+                raise ValueError(f"Invalid VAT/IVA amount: {value}") from exc
+        elif token in {"tip", "tips"}:
+            try:
+                tips = float(value.replace(",", ""))
+            except ValueError as exc:
+                raise ValueError(f"Invalid tip amount: {value}") from exc
         saw_change = True
     if not saw_change:
         raise ValueError("Missing change details")
@@ -818,6 +965,8 @@ def _parse_change_args(args: list[str]) -> dict[str, object]:
         "category": category,
         "amount": amount,
         "currency": currency,
+        "vat_amount": vat_amount,
+        "tips": tips,
         "comment": comment,
         "status": status,
     }
@@ -945,6 +1094,7 @@ def _display_value(value: object) -> str:
 
 def format_telegram_config(settings: Settings, auto_process: bool | None = None) -> str:
     allowed_count = len(settings.telegram_allowed_user_ids)
+    missing_processing = missing_photo_processing_packages()
     lines = [
         "Telegram bot config:",
         f"Bot token: {'configured' if settings.telegram_bot_token else 'missing'}",
@@ -955,6 +1105,8 @@ def format_telegram_config(settings: Settings, auto_process: bool | None = None)
         f"Company profile: {company_profile_status(settings.company_profile, settings.root)}",
         f"Inbound photo folder: {settings.inbound_dir / 'telegram' / '<telegram_user_id>' / 'YYYY-MM-DD'}",
         f"Qwen OCR: {'enabled' if settings.qwen_api_key else 'disabled'}",
+        f"OpenCV splitter: {'READY' if 'cv2' not in missing_processing else 'MISSING'}",
+        f"Photo processing packages: {'READY' if not missing_processing else 'MISSING ' + ', '.join(missing_processing)}",
         "OpenAI fallback: removed",
         f"Polling startup: {'READY' if telegram_polling_ready(settings) else 'NOT READY'}",
         f"Photo ingestion: {'READY' if telegram_config_ready(settings) else 'NOT READY'}",
@@ -963,6 +1115,8 @@ def format_telegram_config(settings: Settings, auto_process: bool | None = None)
         lines.append("Set TELEGRAM_BOT_TOKEN in .env before starting polling.")
     if not telegram_package_ready():
         lines.append('Install python-telegram-bot with: python -m pip install "python-telegram-bot>=22.0"')
+    if missing_processing:
+        lines.append('Install photo processing packages in this Python runtime: python -m pip install "opencv-python>=4.9.0" "Pillow>=10.0.0" "numpy>=1.24,<2.4" "openpyxl>=3.1.0"')
     if not settings.telegram_allowed_user_ids:
         lines.append("Set TELEGRAM_ALLOWED_USER_IDS before sending photos; empty allow-list rejects all photos.")
     if settings.telegram_bot_token and not settings.telegram_allowed_user_ids:
@@ -977,6 +1131,12 @@ def format_telegram_config(settings: Settings, auto_process: bool | None = None)
 def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> None:
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    missing_processing = missing_photo_processing_packages()
+    if resolve_auto_process(settings, auto_process) and missing_processing:
+        raise RuntimeError(
+            "Auto scan cannot start because photo processing packages are missing: "
+            + ", ".join(missing_processing)
+        )
     lock_path = _acquire_telegram_instance_lock(settings)
     try:
         from telegram import BotCommand, MenuButtonCommands, Update
@@ -1039,24 +1199,42 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
     async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await reply_not_allowed(update):
             return
-        if update.effective_message and update.effective_user:
-            await update.effective_message.reply_text(status_message(settings, update.effective_user.id, user_language(settings, update.effective_user.id)))
+        message = update.effective_message
+        user = update.effective_user
+        if message is None or user is None:
+            return
+        lang = user_language(settings, user.id)
+        text = await asyncio.to_thread(status_message, settings, user.id, lang)
+        await message.reply_text(text)
 
     async def restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await reply_not_allowed(update):
             return
-        if update.effective_message and update.effective_user:
-            count, summary = retry_failed(settings, update.effective_user.id)
+        message = update.effective_message
+        user = update.effective_user
+        if message is not None and user is not None:
+            lang = user_language(settings, user.id)
+            await message.reply_text(
+                "\u5df2\u6536\u5230 /restart\uff0c\u6b63\u5728\u68c0\u67e5\u5931\u8d25\u6216\u4e2d\u65ad\u7684\u7167\u7247\u2026\u2026"
+                if is_zh(lang)
+                else "Restart received. Checking failed or interrupted photos..."
+            )
+            try:
+                count, summary = await asyncio.to_thread(retry_failed, settings, user.id)
+            except Exception as exc:
+                await message.reply_text(
+                    f"\u91cd\u542f\u5931\u8d25\uff1a{exc}" if is_zh(lang) else f"Restart failed: {exc}"
+                )
+                return
             started = start_background_worker(
                 settings,
-                update.effective_user.id,
+                user.id,
                 item_callback=_telegram_item_notifier(settings, context.bot, asyncio.get_running_loop()),
             )
-            lang = user_language(settings, update.effective_user.id)
-            await update.effective_message.reply_text(
-                "\n".join(["重试失败照片", f"已重新入队：{count}", f"扫描器：{'已启动' if started else '正在运行'}", _format_status(summary, lang)])
+            await message.reply_text(
+                "\n".join(["重试失败/中断照片", f"已重新入队：{count}", f"扫描器：{'已启动' if started else '正在运行'}", _format_status(summary, lang)])
                 if is_zh(lang)
-                else "\n".join(["Restart", f"Failed photos retried: {count}", f"Scanner: {'started' if started else 'already running'}", _format_status(summary, lang)])
+                else "\n".join(["Restart", f"Failed/interrupted photos retried: {count}", f"Scanner: {'started' if started else 'already running'}", _format_status(summary, lang)])
             )
 
     async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1226,14 +1404,36 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
             return
 
         photo_size = message.photo[-1]
-        telegram_file = await context.bot.get_file(photo_size.file_id)
         now = datetime.now()
         day_dir = telegram_user_day_dir(settings, user.id, now)
         day_dir.mkdir(parents=True, exist_ok=True)
         target = day_dir / telegram_photo_filename(now, photo_size.file_id, photo_size.file_unique_id)
-        await telegram_file.download_to_drive(custom_path=Path(target))
+        try:
+            await download_telegram_media(context.bot, photo_size.file_id, target)
+        except Exception as exc:
+            LOGGER.warning("Telegram photo download failed for user %s after retries: %s", user.id, exc)
+            lang = user_language(settings, user.id)
+            reply = (
+                "\u7167\u7247\u4e0b\u8f7d\u5931\u8d25\uff1aTelegram \u7f51\u7edc\u8d85\u65f6\u3002\u8fd9\u5f20\u7167\u7247\u5c1a\u672a\u5165\u961f\uff0c\u8bf7\u91cd\u65b0\u53d1\u9001\u3002"
+                if is_zh(lang)
+                else "Photo download failed because Telegram timed out. It was not queued; please send it again."
+            )
+            try:
+                await message.reply_text(reply)
+            except Exception:
+                LOGGER.exception("Could not send Telegram photo download failure reply to user %s", user.id)
+            return
         grouped_upload = mark_source_for_group_if_armed(telegram_user_output_dir(settings, user.id), target)
-        enqueue_photo(settings, user.id, target, now)
+        enqueue_photo(
+            settings,
+            user.id,
+            target,
+            now,
+            image_width=int(getattr(photo_size, "width", 0) or 0),
+            image_height=int(getattr(photo_size, "height", 0) or 0),
+            file_size=int(target.stat().st_size),
+            upload_quality=telegram_photo_quality(getattr(photo_size, "width", 0), getattr(photo_size, "height", 0)),
+        )
 
         should_process = resolve_auto_process(settings, auto_process)
         if should_process:
@@ -1267,14 +1467,33 @@ def run_polling_bot(settings: Settings, auto_process: bool | None = None) -> Non
             await message.reply_text("请发送图片文件，或普通照片。" if is_zh(lang) else "Please send an image file, or a normal photo.")
             return
 
-        telegram_file = await context.bot.get_file(document.file_id)
         now = datetime.now()
         day_dir = telegram_user_day_dir(settings, user.id, now)
         day_dir.mkdir(parents=True, exist_ok=True)
         target = day_dir / telegram_image_document_filename(now, document.file_id, document.file_name, getattr(document, "file_unique_id", None))
-        await telegram_file.download_to_drive(custom_path=Path(target))
+        try:
+            await download_telegram_media(context.bot, document.file_id, target)
+        except Exception as exc:
+            LOGGER.warning("Telegram image document download failed for user %s after retries: %s", user.id, exc)
+            reply = (
+                "\u56fe\u7247\u6587\u4ef6\u4e0b\u8f7d\u5931\u8d25\uff1aTelegram \u7f51\u7edc\u8d85\u65f6\u3002\u8be5\u6587\u4ef6\u5c1a\u672a\u5165\u961f\uff0c\u8bf7\u91cd\u65b0\u53d1\u9001\u3002"
+                if is_zh(lang)
+                else "Image download failed because Telegram timed out. It was not queued; please send it again."
+            )
+            try:
+                await message.reply_text(reply)
+            except Exception:
+                LOGGER.exception("Could not send Telegram image download failure reply to user %s", user.id)
+            return
         grouped_upload = mark_source_for_group_if_armed(telegram_user_output_dir(settings, user.id), target)
-        enqueue_photo(settings, user.id, target, now)
+        enqueue_photo(
+            settings,
+            user.id,
+            target,
+            now,
+            file_size=int(target.stat().st_size),
+            upload_quality="original",
+        )
 
         should_process = resolve_auto_process(settings, auto_process)
         if should_process:

@@ -1,8 +1,9 @@
 import tempfile
 import unittest
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 from openpyxl import load_workbook
 
@@ -16,17 +17,24 @@ from invoice_system.reimbursement_excel import (
     OTHER_EXP_SHEET,
     REIMBURSEMENT_WORKBOOK_NAME,
     SUMMARY_SHEET,
+    TIPS_MXN_HEADER,
+    VAT_MXN_HEADER,
     ReimbursementWorkbook,
     assign_available_line_numbers,
     apply_reimbursement_group,
     build_checked_outputs,
     change_reimbursement_record,
     clear_generated_crops,
+    confirm_review_repair,
     corrected_crop_names,
     focus_reimbursement_workbook,
     load_reimbursement_records,
+    initialize_review_architecture,
     preview_reimbursement_group,
+    preview_review_repair,
+    reverse_review_sync_for_source,
     rerun_checked_from_finance_edits,
+    sync_source_to_review,
 )
 
 
@@ -37,6 +45,209 @@ def _date_text(value):
 
 
 class ReimbursementExcelTests(unittest.TestCase):
+    def test_source_sync_appends_only_new_trace_and_preserves_blank_status_manual_edits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workbook = root / REIMBURSEMENT_WORKBOOK_NAME
+            old_crop = root / "crops" / "001_2026-10-05_MXN_50.50_Cafe.jpg"
+            new_crop = root / "crops" / "002_2026-07-02_MXN_80.00_Pemex.jpg"
+            old_source = root / "old.jpg"
+            new_source = root / "new.jpg"
+            old = InvoiceRecord(
+                line_no=1, invoice_date="2026-10-05", seller="Cafe", expense_category="Food",
+                currency="MXN", total_amount=50.5, crop_image=str(old_crop), source_image=str(old_source),
+            )
+            new = InvoiceRecord(
+                line_no=2, invoice_date="2026-07-02", seller="Pemex", expense_category="Gas",
+                currency="MXN", total_amount=80, crop_image=str(new_crop), source_image=str(new_source),
+            )
+            ReimbursementWorkbook(workbook).write_records([old])
+            wb = load_workbook(workbook)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                ws.cell(2, 3).value = "2026-05-10"
+                ws.cell(2, 9).value = "Manual Cafe Name"
+                self.assertIsNone(ws.cell(2, 2).value)
+                wb.save(workbook)
+            finally:
+                wb.close()
+
+            sync_source_to_review(root, new_source, [new], [old, new])
+
+            wb = load_workbook(workbook, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                self.assertEqual(ws.max_row, 3)
+                self.assertEqual(_date_text(ws.cell(2, 3).value), "2026-05-10")
+                self.assertEqual(ws.cell(2, 9).value, "Manual Cafe Name")
+                self.assertEqual(ws.cell(3, 14).value, "002")
+                self.assertEqual(ws.cell(3, 9).value, "Pemex")
+            finally:
+                wb.close()
+
+    def test_source_sync_payment_updates_only_financial_fields_and_is_reversible(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workbook = root / REIMBURSEMENT_WORKBOOK_NAME
+            detail_crop = root / "crops" / "037_2026-05-09_MXN_566.00_Sushi_Roll.jpg"
+            payment_crop = root / "crops" / "163_2026-05-09_MXN_622.60_Sushi_Roll_card.jpg"
+            detail_source = root / "detail.jpg"
+            payment_source = root / "payment.jpg"
+            detail = InvoiceRecord(
+                line_no=37, invoice_date="2026-05-09", seller="SUSHI ROLL", contents="Restaurant detail receipt",
+                expense_category="Food", currency="MXN", total_amount=566, vat_amount=78,
+                crop_image=str(detail_crop), source_image=str(detail_source), report_components=True,
+            )
+            payment = InvoiceRecord(
+                line_no=163, invoice_date="2026-05-09", seller="SUSHI ROLL", contents="BBVA tarjeta pago propina",
+                expense_category="Food", currency="MXN", total_amount=622.60, tips=56.60,
+                crop_image=str(payment_crop), source_image=str(payment_source), report_components=True,
+            )
+            ReimbursementWorkbook(workbook).write_records([detail])
+
+            result = sync_source_to_review(root, payment_source, [payment], [detail, payment])
+
+            self.assertEqual(result.updated_trace_ids, ("037",))
+            self.assertEqual(result.appended_records, ())
+            loaded = load_reimbursement_records(workbook)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual([Path(value).name for value in loaded[0].supporting_crop_images], [payment_crop.name])
+            self.assertIn("supporting crop 163 kept", loaded[0].remarks)
+            wb = load_workbook(workbook, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                headers = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                self.assertEqual(ws.max_row, 2)
+                self.assertEqual(_date_text(ws.cell(2, headers["Date"]).value), "2026-05-09")
+                self.assertEqual(ws.cell(2, headers["Merchant"]).value, "SUSHI ROLL")
+                self.assertEqual(ws.cell(2, headers["Accounting Category"]).value, "Food")
+                self.assertEqual(ws.cell(2, headers[VAT_MXN_HEADER]).value, 78)
+                self.assertEqual(ws.cell(2, headers["MXN Amount"]).value, 622.6)
+                self.assertEqual(ws.cell(2, headers[TIPS_MXN_HEADER]).value, 56.6)
+                self.assertIn("_crop_links", wb.sheetnames)
+            finally:
+                wb.close()
+
+            reversed_result = reverse_review_sync_for_source(root, payment_source, {"163"})
+            self.assertEqual(reversed_result.restored_trace_ids, ("037",))
+            wb = load_workbook(workbook, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                headers = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                self.assertEqual(ws.cell(2, headers["MXN Amount"]).value, 566)
+                self.assertEqual(ws.cell(2, headers[TIPS_MXN_HEADER]).value, 0)
+                self.assertNotIn("_crop_links", wb.sheetnames)
+            finally:
+                wb.close()
+
+    def test_source_sync_protected_pair_appends_and_warns(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workbook = root / REIMBURSEMENT_WORKBOOK_NAME
+            detail_source = root / "detail.jpg"
+            payment_source = root / "payment.jpg"
+            detail = InvoiceRecord(
+                line_no=1, invoice_date="2026-07-01", seller="Cafe Uno", contents="food detail",
+                expense_category="Food", currency="MXN", total_amount=100, vat_amount=16,
+                crop_image=str(root / "crops" / "001_detail.jpg"), source_image=str(detail_source),
+            )
+            payment = InvoiceRecord(
+                line_no=2, invoice_date="2026-07-01", seller="Cafe Uno", contents="tarjeta propina",
+                expense_category="Food", currency="MXN", total_amount=115,
+                crop_image=str(root / "crops" / "002_card.jpg"), source_image=str(payment_source),
+            )
+            ReimbursementWorkbook(workbook).write_records([detail])
+            wb = load_workbook(workbook)
+            try:
+                wb[INVOICE_EXP_SHEET].cell(2, 2).value = "ok"
+                wb.save(workbook)
+            finally:
+                wb.close()
+
+            result = sync_source_to_review(root, payment_source, [payment], [detail, payment])
+
+            self.assertEqual(len(result.appended_records), 1)
+            self.assertTrue(any("protected 001" in warning for warning in result.warnings))
+            wb = load_workbook(workbook, data_only=True)
+            try:
+                self.assertEqual(wb[INVOICE_EXP_SHEET].max_row, 3)
+            finally:
+                wb.close()
+
+    def test_source_sync_recovers_excel_saved_before_sync_state_without_duplicate(self):
+        import invoice_system.reimbursement_excel as reimbursement_excel
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "new.jpg"
+            record = InvoiceRecord(
+                line_no=1, invoice_date="2026-07-01", seller="Cafe", expense_category="Food",
+                currency="MXN", total_amount=10, crop_image=str(root / "crops" / "001_cafe.jpg"),
+                source_image=str(source),
+            )
+            initialize_review_architecture(root, [])
+            original_save = reimbursement_excel._save_review_sync_state
+            calls = 0
+
+            def fail_after_excel(path, data):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise RuntimeError("simulated crash after Review save")
+                original_save(path, data)
+
+            with patch.object(reimbursement_excel, "_save_review_sync_state", side_effect=fail_after_excel):
+                with self.assertRaisesRegex(RuntimeError, "simulated crash"):
+                    sync_source_to_review(root, source, [record], [record])
+
+            recovered = sync_source_to_review(root, source, [record], [record])
+            self.assertTrue(recovered.already_committed)
+            wb = load_workbook(root / REIMBURSEMENT_WORKBOOK_NAME, data_only=True)
+            try:
+                self.assertEqual(wb[INVOICE_EXP_SHEET].max_row, 2)
+            finally:
+                wb.close()
+
+    def test_repair_review_requires_unchanged_explicit_preview(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workbook = root / REIMBURSEMENT_WORKBOOK_NAME
+            source = root / "source.jpg"
+            crop = root / "crops" / "001_cafe.jpg"
+            machine = InvoiceRecord(
+                line_no=1, invoice_date="2026-07-01", seller="Machine Cafe", expense_category="Food",
+                currency="MXN", total_amount=10, crop_image=str(crop), source_image=str(source),
+            )
+            ReimbursementWorkbook(workbook).write_records([machine])
+            wb = load_workbook(workbook)
+            try:
+                wb[INVOICE_EXP_SHEET].cell(2, 9).value = "Manual Cafe"
+                wb.save(workbook)
+            finally:
+                wb.close()
+            before = workbook.read_bytes()
+
+            preview = preview_review_repair(root, [machine])
+
+            self.assertEqual(workbook.read_bytes(), before)
+            self.assertEqual(preview.changed, 1)
+            wb = load_workbook(workbook)
+            try:
+                wb[INVOICE_EXP_SHEET].cell(2, 10).value = "edited after preview"
+                wb.save(workbook)
+            finally:
+                wb.close()
+            with self.assertRaisesRegex(RuntimeError, "changed after preview"):
+                confirm_review_repair(root, preview.preview_id, [machine])
+
+            fresh = preview_review_repair(root, [machine])
+            confirm_review_repair(root, fresh.preview_id, [machine])
+            wb = load_workbook(workbook, data_only=True)
+            try:
+                self.assertEqual(wb[INVOICE_EXP_SHEET].cell(2, 9).value, "Machine Cafe")
+            finally:
+                wb.close()
+
     def test_reimbursement_workbook_name_is_real_chinese(self):
         self.assertEqual(REIMBURSEMENT_WORKBOOK_NAME, "报销明细_2026_xlsx.xlsx")
 
@@ -53,7 +264,10 @@ class ReimbursementExcelTests(unittest.TestCase):
                 expense_category="Food",
                 currency="USD",
                 total_amount=10,
+                vat_amount=1.6,
+                tips=2,
                 seller="Cafe",
+                report_components=True,
             )
 
             store.write_records([record])
@@ -62,15 +276,19 @@ class ReimbursementExcelTests(unittest.TestCase):
             try:
                 ws = wb[INVOICE_EXP_SHEET]
                 self.assertEqual(ws.cell(1, 2).value, "Manual status")
-                self.assertEqual(ws.cell(1, 12).value, "Trace ID")
-                self.assertEqual(ws.cell(1, 13).value, "System note")
-                self.assertEqual(ws.cell(1, 14).value, "Invoice link")
+                self.assertEqual(ws.cell(1, 12).value, "IVA/VAT MXN")
+                self.assertEqual(ws.cell(1, 13).value, "Tips MXN")
+                self.assertEqual(ws.cell(1, 14).value, "Trace ID")
+                self.assertEqual(ws.cell(1, 15).value, "System note")
+                self.assertEqual(ws.cell(1, 16).value, "Invoice link")
                 self.assertEqual(ws.cell(2, 4).value, 175)
                 self.assertEqual(ws.cell(2, 5).value, "餐饮")
                 self.assertEqual(ws.cell(2, 6).value, "USD")
                 self.assertEqual(ws.cell(2, 7).value, 10)
                 self.assertEqual(ws.cell(2, 8).value, 17.5)
                 self.assertEqual(ws.cell(2, 11).value, "Food")
+                self.assertEqual(ws.cell(2, 12).value, 28)
+                self.assertEqual(ws.cell(2, 13).value, 35)
                 rates = wb["exchange rate"]
                 self.assertEqual(rates.cell(1, 1).value, "日期")
                 self.assertEqual(rates.cell(1, 2).value, "USD")
@@ -98,6 +316,31 @@ class ReimbursementExcelTests(unittest.TestCase):
                 self.assertEqual(wb[INVOICE_EXP_SHEET].cell(3, 9).value, "Pemex")
                 self.assertNotIn(FOOD_EXP_SHEET, wb.sheetnames)
                 self.assertNotIn(OTHER_EXP_SHEET, wb.sheetnames)
+            finally:
+                wb.close()
+
+    def test_legacy_record_does_not_backfill_vat_or_tips_columns(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / REIMBURSEMENT_WORKBOOK_NAME
+            record = InvoiceRecord(
+                line_no=99,
+                invoice_date="2026-06-05",
+                expense_category="Food",
+                total_amount=331.10,
+                vat_amount=16,
+                tips=30.10,
+                seller="Legacy Cafe",
+                report_components=False,
+            )
+
+            ReimbursementWorkbook(path).write_records([record])
+
+            wb = load_workbook(path, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                headers = {cell.value: cell.column for cell in ws[1]}
+                self.assertIsNone(ws.cell(2, headers["IVA/VAT MXN"]).value)
+                self.assertIsNone(ws.cell(2, headers["Tips MXN"]).value)
             finally:
                 wb.close()
 
@@ -129,6 +372,110 @@ class ReimbursementExcelTests(unittest.TestCase):
                 self.assertEqual(ws.cell(2, 6).value, "USD")
                 self.assertEqual(ws.cell(2, 7).value, 40)
                 self.assertEqual(ws.cell(2, 8).value, 17.5)
+            finally:
+                wb.close()
+
+    def test_exchange_rate_window_uses_all_invoice_dates_and_stops_at_last_invoice(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / REIMBURSEMENT_WORKBOOK_NAME
+            calls = []
+
+            def fetch_rates(start, end):
+                calls.append((start, end))
+                return [
+                    ExchangeRate(day, usd_cny_per_100=700, mxn_per_100_cny=250)
+                    for day in {start, end}
+                ]
+
+            store = ReimbursementWorkbook(path, fetch_rates=fetch_rates)
+            store.write_records(
+                [
+                    InvoiceRecord(invoice_date="2026-05-01", currency="MXN", total_amount=100, seller="Cafe"),
+                    InvoiceRecord(invoice_date="2026-05-05", currency="USD", total_amount=10, seller="Store"),
+                ]
+            )
+
+            self.assertEqual(calls, [(date(2026, 4, 21), date(2026, 5, 5))])
+            wb = load_workbook(path, data_only=True)
+            try:
+                rate_dates = [
+                    _date_text(row[0])
+                    for row in wb["exchange rate"].iter_rows(min_row=2, values_only=True)
+                    if row[0]
+                ]
+                self.assertEqual(
+                    rate_dates,
+                    ["2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05"],
+                )
+            finally:
+                wb.close()
+
+    def test_new_foreign_currency_refreshes_full_review_range_and_checked_copies_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / REIMBURSEMENT_WORKBOOK_NAME
+            calls = []
+
+            def fetch_rates(start, end):
+                calls.append((start, end))
+                days = (end - start).days + 1
+                return [
+                    ExchangeRate(start + timedelta(days=offset), usd_cny_per_100=700, mxn_per_100_cny=250)
+                    for offset in range(days)
+                ]
+
+            old_source = root / "old.jpg"
+            new_source = root / "new.jpg"
+            old = InvoiceRecord(
+                line_no=1,
+                invoice_date="2026-05-01",
+                currency="MXN",
+                total_amount=20,
+                seller="Cafe",
+                source_image=str(old_source),
+                crop_image=str(root / "crops" / "001_old.jpg"),
+            )
+            new = InvoiceRecord(
+                line_no=2,
+                invoice_date="2026-07-13",
+                currency="USD",
+                total_amount=10,
+                seller="Store",
+                source_image=str(new_source),
+                crop_image=str(root / "crops" / "002_new.jpg"),
+            )
+            ReimbursementWorkbook(path).write_records([old])
+            wb = load_workbook(path)
+            try:
+                old_row = tuple(wb[INVOICE_EXP_SHEET].iter_rows(min_row=2, max_row=2, values_only=True))[0]
+            finally:
+                wb.close()
+
+            calls.clear()
+            sync_source_to_review(root, new_source, [new], [old, new], fetch_rates=fetch_rates)
+            self.assertEqual(calls, [(date(2026, 4, 21), date(2026, 7, 13))])
+            calls.clear()
+            result = build_checked_outputs(root, fetch_rates=fetch_rates)
+
+            self.assertEqual(calls, [(date(2026, 4, 21), date(2026, 7, 13))])
+            for workbook_path in (path, result.workbook_path):
+                wb = load_workbook(workbook_path, data_only=True)
+                try:
+                    rate_dates = [
+                        row[0].date() if hasattr(row[0], "date") else row[0]
+                        for row in wb["exchange rate"].iter_rows(min_row=2, values_only=True)
+                        if row[0]
+                    ]
+                    self.assertEqual(min(rate_dates), date(2026, 5, 1))
+                    self.assertEqual(max(rate_dates), date(2026, 7, 13))
+                finally:
+                    wb.close()
+            wb = load_workbook(path, data_only=False)
+            try:
+                self.assertEqual(
+                    tuple(wb[INVOICE_EXP_SHEET].iter_rows(min_row=2, max_row=2, values_only=True))[0],
+                    old_row,
+                )
             finally:
                 wb.close()
 
@@ -355,7 +702,17 @@ class ReimbursementExcelTests(unittest.TestCase):
                 crop.write_bytes(b"jpg")
             ReimbursementWorkbook(path).write_records(
                 [
-                    InvoiceRecord(line_no=1, invoice_date="2026-06-12", expense_category="Food", total_amount=100, seller="Cafe", crop_image=str(crop1)),
+                    InvoiceRecord(
+                        line_no=1,
+                        invoice_date="2026-06-12",
+                        expense_category="Food",
+                        total_amount=100,
+                        vat_amount=16,
+                        tips=10,
+                        seller="Cafe",
+                        crop_image=str(crop1),
+                        report_components=True,
+                    ),
                     InvoiceRecord(line_no=2, invoice_date="2026-06-13", expense_category="Gas", total_amount=200, seller="Pemex", crop_image=str(crop2)),
                     InvoiceRecord(line_no=3, invoice_date="2026-06-14", expense_category="Other", total_amount=50, seller="Store", crop_image=str(crop3)),
                 ]
@@ -368,7 +725,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             finally:
                 wb.close()
 
-            result = build_checked_outputs(root)
+            result = build_checked_outputs(root, refresh_exchange_rates=False)
 
             self.assertEqual(result.records_written, 2)
             self.assertEqual(result.crops_written, 2)
@@ -385,6 +742,8 @@ class ReimbursementExcelTests(unittest.TestCase):
                 food_headers = {checked[FOOD_EXP_SHEET].cell(1, col).value: col for col in range(1, checked[FOOD_EXP_SHEET].max_column + 1)}
                 other_headers = {checked[OTHER_EXP_SHEET].cell(1, col).value: col for col in range(1, checked[OTHER_EXP_SHEET].max_column + 1)}
                 self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, food_headers["Merchant"]).value, "Cafe")
+                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, food_headers["IVA/VAT MXN"]).value, 16)
+                self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, food_headers["Tips MXN"]).value, 10)
                 self.assertEqual(checked[FOOD_EXP_SHEET].cell(2, food_headers["Trace ID"]).value, "001")
                 self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, other_headers["Merchant"]).value, "Store")
                 self.assertEqual(checked[OTHER_EXP_SHEET].cell(2, other_headers["Trace ID"]).value, "003")
@@ -432,7 +791,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             finally:
                 wb.close()
 
-            build_checked_outputs(root)
+            build_checked_outputs(root, refresh_exchange_rates=False)
 
             checked = load_workbook(root / CHECKED_WORKBOOK_NAME, data_only=True)
             try:
@@ -478,7 +837,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             ]
             store = ReimbursementWorkbook(path)
             store.write_records(records)
-            build_checked_outputs(root)
+            build_checked_outputs(root, refresh_exchange_rates=False)
             first_final = root / "final_crops" / "food" / "001_trace001_2026-06-12_MXN_100.00_Cafe.jpg"
             first_final.write_bytes(b"sentinel")
 
@@ -488,7 +847,7 @@ class ReimbursementExcelTests(unittest.TestCase):
                     InvoiceRecord(line_no=3, invoice_date="2026-06-14", expense_category="Other", total_amount=25, seller="Kiosk", crop_image=str(crop3)),
                 ]
             )
-            result = build_checked_outputs(root)
+            result = build_checked_outputs(root, refresh_exchange_rates=False)
 
             self.assertEqual(result.crops_written, 3)
             self.assertEqual(first_final.read_bytes(), b"sentinel")
@@ -511,7 +870,7 @@ class ReimbursementExcelTests(unittest.TestCase):
                     InvoiceRecord(line_no=2, invoice_date="2026-06-13", expense_category="Other", total_amount=50, seller="Store", crop_image=str(crop2)),
                 ]
             )
-            build_checked_outputs(root)
+            build_checked_outputs(root, refresh_exchange_rates=False)
             deleted_final = root / "final_crops" / "food" / "001_trace001_2026-06-12_MXN_100.00_Cafe.jpg"
             self.assertTrue(deleted_final.exists())
             wb = load_workbook(path)
@@ -522,7 +881,7 @@ class ReimbursementExcelTests(unittest.TestCase):
             finally:
                 wb.close()
 
-            build_checked_outputs(root)
+            build_checked_outputs(root, refresh_exchange_rates=False)
 
             self.assertFalse(deleted_final.exists())
             manifest = json.loads((root / FINAL_CROPS_MANIFEST).read_text(encoding="utf-8"))
@@ -544,7 +903,7 @@ class ReimbursementExcelTests(unittest.TestCase):
                 [InvoiceRecord(line_no=1, invoice_date="2026-06-12", expense_category="Food", total_amount=100, seller="Cafe", crop_image=str(crop))]
             )
 
-            result = build_checked_outputs(root, force=True)
+            result = build_checked_outputs(root, force=True, refresh_exchange_rates=False)
 
             self.assertEqual(result.crops_written, 1)
             self.assertFalse(stale.exists())
@@ -576,7 +935,7 @@ class ReimbursementExcelTests(unittest.TestCase):
                 ]
             )
 
-            result = build_checked_outputs(root)
+            result = build_checked_outputs(root, refresh_exchange_rates=False)
 
             self.assertEqual(result.records_written, 1)
             self.assertEqual(result.crops_written, 1)
@@ -695,6 +1054,51 @@ class ReimbursementExcelTests(unittest.TestCase):
             finally:
                 wb.close()
 
+    def test_change_reimbursement_record_can_clear_date_and_correct_tax_tip(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / REIMBURSEMENT_WORKBOOK_NAME
+            crop = root / "crops" / "021_2026-06-12_MXN_170.00_Nota.jpg"
+            crop.parent.mkdir()
+            crop.write_bytes(b"jpg")
+            ReimbursementWorkbook(path).write_records(
+                [
+                    InvoiceRecord(
+                        line_no=21,
+                        invoice_date="2026-06-12",
+                        expense_category="Food",
+                        total_amount=170,
+                        vat_amount=10,
+                        tips=30,
+                        seller="Nota De Cuenta",
+                        crop_image=str(crop),
+                        report_components=True,
+                    )
+                ]
+            )
+
+            change_reimbursement_record(
+                root,
+                "021",
+                invoice_date="",
+                amount=140,
+                vat_amount=0,
+                tips=0,
+                status="correct",
+            )
+
+            wb = load_workbook(path, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                columns = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                self.assertIsNone(ws.cell(2, columns["Date"]).value)
+                self.assertEqual(ws.cell(2, columns["MXN Amount"]).value, 140)
+                self.assertEqual(ws.cell(2, columns[VAT_MXN_HEADER]).value, 0)
+                self.assertEqual(ws.cell(2, columns[TIPS_MXN_HEADER]).value, 0)
+                self.assertEqual(ws.cell(2, columns["Manual status"]).value, "correct")
+            finally:
+                wb.close()
+
     def test_manual_no_syncs_to_crop_id_and_change_uses_crop_id(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -767,7 +1171,7 @@ class ReimbursementExcelTests(unittest.TestCase):
                 wb.close()
 
             change_reimbursement_record(root, "021", status="delete")
-            checked = build_checked_outputs(root)
+            checked = build_checked_outputs(root, refresh_exchange_rates=False)
 
             self.assertEqual(checked.records_written, 0)
             self.assertEqual(checked.crops_written, 0)
@@ -834,7 +1238,7 @@ class ReimbursementExcelTests(unittest.TestCase):
                 ]
             )
 
-            result = build_checked_outputs(root)
+            result = build_checked_outputs(root, refresh_exchange_rates=False)
 
             self.assertEqual(result.records_written, 1)
             self.assertFalse((root / "review_crops" / legacy_final.name).exists())
@@ -893,16 +1297,136 @@ class ReimbursementExcelTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            build_checked_outputs(root)
+            build_checked_outputs(root, refresh_exchange_rates=False)
 
             wb = load_workbook(path, data_only=False)
             try:
                 ws = wb[INVOICE_EXP_SHEET]
                 columns = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
                 link = ws.cell(2, columns["Invoice link"]).hyperlink.target
-                self.assertEqual(link, "crops/021_2025-12-03_USD_38.33_ALICIA.jpg")
+                self.assertEqual(link, f"review_crops/{old_review.name}")
                 self.assertEqual(ws.cell(1, columns["Manual status"]).value, "Manual status")
                 self.assertFalse((root / "review_crops" / raw_crop.name).exists())
+            finally:
+                wb.close()
+
+    def test_change_preserves_distinct_trace_ids_for_same_merchant_and_amount(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            path = root / REIMBURSEMENT_WORKBOOK_NAME
+            crop_111 = root / "crops" / "111_unknown-date_MXN_150.00_Nota_De_Cuenta.jpg"
+            crop_207 = root / "crops" / "207_unknown-date_MXN_150.00_Nota_De_Cuenta.jpg"
+            crop_111.parent.mkdir()
+            crop_111.write_bytes(b"111")
+            crop_207.write_bytes(b"207")
+            ReimbursementWorkbook(path).write_records(
+                [
+                    InvoiceRecord(
+                        line_no=111,
+                        expense_category="Food",
+                        total_amount=150,
+                        seller="Nota De Cuenta",
+                        crop_image=str(crop_111),
+                    ),
+                    InvoiceRecord(
+                        line_no=207,
+                        expense_category="Food",
+                        total_amount=150,
+                        seller="Nota De Cuenta",
+                        crop_image=str(crop_207),
+                    ),
+                ]
+            )
+            (root / "processing_state.json").write_text(
+                json.dumps(
+                    {
+                        "records": [
+                            {
+                                "invoice_date": "",
+                                "seller": "Nota De Cuenta",
+                                "currency": "MXN",
+                                "total_amount": 150,
+                                "crop_image": str(crop_111),
+                            },
+                            {
+                                "invoice_date": "",
+                                "seller": "Nota De Cuenta",
+                                "currency": "MXN",
+                                "total_amount": 150,
+                                "crop_image": str(crop_207),
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            change_reimbursement_record(root, "207", comment="verified")
+
+            wb = load_workbook(path, data_only=False)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                columns = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                identities = [
+                    (
+                        str(ws.cell(row, columns["Trace ID"]).value).zfill(3),
+                        Path(str(ws.cell(row, columns["Invoice link"]).value)).name,
+                    )
+                    for row in range(2, ws.max_row + 1)
+                ]
+                self.assertEqual(
+                    identities,
+                    [("111", crop_111.name), ("207", crop_207.name)],
+                )
+            finally:
+                wb.close()
+
+    def test_source_sync_appends_undated_possible_duplicate_and_names_old_trace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workbook = root / REIMBURSEMENT_WORKBOOK_NAME
+            old_source = root / "old.jpg"
+            new_source = root / "new.jpg"
+            old = InvoiceRecord(
+                line_no=111,
+                invoice_date="2026-06-06",
+                seller="Nota De Cuenta",
+                expense_category="Food",
+                currency="MXN",
+                total_amount=150,
+                crop_image=str(root / "crops" / "111_old.jpg"),
+                source_image=str(old_source),
+            )
+            new = InvoiceRecord(
+                line_no=207,
+                invoice_date="",
+                seller="Nota De Cuenta",
+                expense_category="Food",
+                currency="MXN",
+                total_amount=150,
+                crop_image=str(root / "crops" / "207_new.jpg"),
+                source_image=str(new_source),
+            )
+            ReimbursementWorkbook(workbook).write_records([old])
+            wb = load_workbook(workbook)
+            try:
+                wb[INVOICE_EXP_SHEET].cell(2, 2).value = "correct"
+                wb.save(workbook)
+            finally:
+                wb.close()
+
+            result = sync_source_to_review(root, new_source, [new], [old, new])
+
+            self.assertEqual(len(result.appended_records), 1)
+            self.assertTrue(any("207 may duplicate 111" in warning for warning in result.warnings))
+            wb = load_workbook(workbook, data_only=True)
+            try:
+                ws = wb[INVOICE_EXP_SHEET]
+                columns = {ws.cell(1, col).value: col for col in range(1, ws.max_column + 1)}
+                traces = [str(ws.cell(row, columns["Trace ID"]).value).zfill(3) for row in range(2, ws.max_row + 1)]
+                self.assertEqual(traces, ["111", "207"])
+                self.assertEqual(ws.cell(2, columns["Manual status"]).value, "correct")
+                self.assertIn("Possible duplicate with 111", ws.cell(3, columns["System note"]).value)
             finally:
                 wb.close()
 
@@ -922,7 +1446,7 @@ class ReimbursementExcelTests(unittest.TestCase):
                     InvoiceRecord(line_no=2, invoice_date="2026-06-13", expense_category="Gas", total_amount=200, seller="Pemex", crop_image=str(other_crop)),
                 ]
             )
-            build_checked_outputs(root)
+            build_checked_outputs(root, refresh_exchange_rates=False)
             _move_checked_row(root / CHECKED_WORKBOOK_NAME, FOOD_EXP_SHEET, OTHER_EXP_SHEET, 2)
 
             result = rerun_checked_from_finance_edits(root)

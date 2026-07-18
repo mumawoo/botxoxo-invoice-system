@@ -38,7 +38,7 @@ class ReimbursementTests(unittest.TestCase):
             settings = _settings(Path(temp))
             _write_reimbursement_workbook(settings, 123)
             output_dir = telegram_user_output_dir(settings, 123)
-            build_checked_outputs(output_dir)
+            build_checked_outputs(output_dir, refresh_exchange_rates=False)
             workbook = telegram_user_workbook(settings, 123)
             wb = load_workbook(workbook)
             try:
@@ -62,6 +62,10 @@ class ReimbursementTests(unittest.TestCase):
             index_state.write_text('{"version": 2, "next_crop_id": 2601022}', encoding="utf-8")
             manifest = output_dir / FINAL_CROPS_MANIFEST
             manifest.write_text('{"version": 1, "records": {}}', encoding="utf-8")
+            system_dir = output_dir / "system"
+            system_dir.mkdir(parents=True)
+            (system_dir / "Scan_Output.xlsx").write_bytes(b"scan")
+            (system_dir / "Review_Sync_State.json").write_text("{}", encoding="utf-8")
 
             result = submit_unsubmitted(settings, 123)
 
@@ -73,11 +77,14 @@ class ReimbursementTests(unittest.TestCase):
             self.assertTrue((result.archived_crops / "other" / "002_trace002_2026-06-13_MXN_200.00_Pemex.jpg").exists())
             self.assertTrue(result.archived_manual_excel.exists())
             self.assertTrue((result.archived_review_crops / "001_2026-06-12_MXN_100.00_Cafe.jpg").exists())
+            self.assertTrue((result.archived_manual_excel.parent / "system" / "Scan_Output.xlsx").exists())
+            self.assertTrue((result.archived_manual_excel.parent / "system" / "Review_Sync_State.json").exists())
             self.assertFalse(telegram_user_workbook(settings, 123).exists())
             self.assertFalse((output_dir / "final_crops").exists())
             self.assertFalse((output_dir / "review_crops").exists())
             self.assertFalse(index_state.exists())
             self.assertFalse(manifest.exists())
+            self.assertFalse(system_dir.exists())
             self.assertIn("SUB-", result.batch_id)
             self.assertIn(result.batch_id, submitted_batches_text(settings, 123))
 

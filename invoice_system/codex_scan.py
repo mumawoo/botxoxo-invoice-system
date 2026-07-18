@@ -16,8 +16,9 @@ PROMPT = f"""Extract this receipt/invoice into strict JSON only.
 Return keys: invoice_date, raw_date, expense_category, contents, currency, total_amount,
 expense_amount, vat_amount, sales_tax, tips, seller, remarks, rotate_degrees,
 orientation_confidence.
-seller, currency, and total_amount are required. Use ISO date YYYY-MM-DD for invoice_date when visible; otherwise return an empty invoice_date string so nearby receipts can supply the date. Also return raw_date exactly as printed on the receipt, such as "10/05/2026". For ambiguous numeric dates, use DD/MM/YYYY for Mexico, Spanish-language, or MXN receipts. Use MM/DD/YYYY only when the receipt is clearly US/English/USD.
+currency and total_amount are required. Use ISO date YYYY-MM-DD for invoice_date when visible; otherwise return an empty invoice_date string and leave it empty. Also return raw_date exactly as printed on the receipt, such as "10/05/2026". Carefully verify every raw-date digit against the image before normalizing it. For ambiguous numeric dates, use DD/MM/YYYY for Mexico, Spanish-language, or MXN receipts. Use MM/DD/YYYY only when the receipt is clearly US/English/USD. For a generic handwritten restaurant pad headed "Nota De Cuenta", use "Nota De Cuenta" as seller rather than leaving seller empty.
 Detect currency from the receipt: use USD for US dollar receipts and MXN for Mexican peso receipts. A "$" symbol alone is ambiguous, so infer from merchant country, tax labels, address, and context before defaulting to MXN. Use 0 for unknown optional amounts.
+Set tips only when the receipt explicitly labels the amount as tip, tips, propina, or gratuity. A handwritten food/drink line item is not a tip. total_amount must be the total visibly written or circled on the receipt; do not create a new total by adding inferred components.
 Payment confirmations and utility bills are valid reimbursement documents. For Multipagos, CFE/Comision Federal de Electricidad, internet payment receipts, or card payment confirmations, use the beneficiary/service provider as seller when visible, use Utilities when it is an electricity/water/gas/utility payment, and extract total_amount from labels such as Importe, Total, Monto, Cantidad, or amount-in-words like "CINCUENTA Y OCHO PESOS 00/100 MXP". Do not treat a Flap/BBVA branding strip as the seller when the document body names the service provider.
 expense_category must be exactly one of: {", ".join(EXPENSE_CATEGORIES)}.
 Also judge the crop orientation while reading it. rotate_degrees must be one of
@@ -62,7 +63,8 @@ def _ocr_result_from_response_text(text: str, engine: str = "codex_scan") -> OCR
     lines = [OCRTextLine(text, 1.0)] if text else []
     try:
         data = _json_data(text)
-        record = _record_from_data(data)
+        default_remarks = "Qwen Scan used" if engine == "qwen_scan" else "Codex Scan used"
+        record = _record_from_data(data, default_remarks=default_remarks)
     except Exception as exc:
         return OCRResult(engine, lines, None, 0.0, str(exc))
     return OCRResult(
@@ -86,7 +88,12 @@ def _json_data(text: str) -> dict:
     return data
 
 
-def _record_from_data(data: dict) -> InvoiceRecord:
+def _record_from_data(
+    data: dict,
+    *,
+    validate: bool = True,
+    default_remarks: str = "Codex Scan used",
+) -> InvoiceRecord:
     contents = str(data.get("contents") or "")
     seller = str(data.get("seller") or "Unknown")
     record = InvoiceRecord(
@@ -100,12 +107,33 @@ def _record_from_data(data: dict) -> InvoiceRecord:
         sales_tax=_float(data.get("sales_tax")),
         tips=_float(data.get("tips")),
         seller=seller,
-        remarks=str(data.get("remarks") or "Codex Scan used"),
+        remarks=str(data.get("remarks") or default_remarks),
+        report_components=True,
     )
-    _validate_record(record)
+    if validate:
+        _validate_record(record)
     if record.expense_amount <= 0 and record.total_amount > 0:
         record.expense_amount = max(record.total_amount - record.vat_amount - record.sales_tax, 0.0)
+    _discard_unlabeled_handwritten_tip(record)
     return record
+
+
+def _discard_unlabeled_handwritten_tip(record: InvoiceRecord) -> None:
+    evidence = f"{record.contents} {record.remarks}".casefold()
+    seller = (record.seller or "").strip().casefold()
+    has_tip_label = any(label in evidence for label in ("tip", "tips", "propina", "gratuity"))
+    if seller != "nota de cuenta" or record.tips <= 0 or has_tip_label or record.expense_amount <= 0:
+        return
+    if abs(record.total_amount - record.expense_amount - record.tips) > 0.51:
+        return
+    record.total_amount = record.expense_amount
+    record.tips = 0.0
+
+
+def partial_record_from_response_text(text: str) -> InvoiceRecord:
+    """Preserve useful Qwen fields when strict validation rejects one missing field."""
+
+    return _record_from_data(_json_data(text), validate=False)
 
 
 def _invoice_date_from_data(data: dict) -> str:

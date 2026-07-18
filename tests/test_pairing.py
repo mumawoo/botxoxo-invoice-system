@@ -1,10 +1,35 @@
 import unittest
 
 from invoice_system.models import InvoiceRecord
-from invoice_system.pairing import pair_invoice_payment_slips
+from invoice_system.pairing import is_possible_duplicate, mark_possible_matches_with_protected, pair_invoice_payment_slips
 
 
 class PairingTests(unittest.TestCase):
+    def test_protected_match_is_warned_but_not_combined(self):
+        protected = InvoiceRecord(
+            invoice_date="2026-05-16",
+            seller="Las Palmas",
+            currency="MXN",
+            total_amount=536,
+            vat_amount=73.93,
+            crop_image="037_receipt.jpg",
+        )
+        payment = InvoiceRecord(
+            invoice_date="2026-05-16",
+            seller="REST HOTEL LAS PALMAS",
+            currency="MXN",
+            total_amount=616.40,
+            contents="VENTA CON PROPINA",
+            crop_image="163_payment.jpg",
+        )
+
+        result = mark_possible_matches_with_protected([payment], [protected])
+
+        self.assertEqual(result, [payment])
+        self.assertEqual(payment.total_amount, 616.40)
+        self.assertIn("Possible pair with protected crop 037", payment.remarks)
+        self.assertIn("payment difference 80.40", payment.remarks)
+
     def test_merges_payment_slip_and_calculates_tip(self):
         invoice = InvoiceRecord(
             invoice_date="2026-06-12",
@@ -146,6 +171,36 @@ class PairingTests(unittest.TestCase):
 
         self.assertEqual(len(paired), 2)
 
+    def test_same_photo_exact_reported_tip_can_pair_despite_bank_merchant_alias(self):
+        source = "telegram_photo.jpg"
+        invoice = InvoiceRecord(
+            invoice_date="2026-06-16", seller="supersalads", currency="MXN", total_amount=233,
+            vat_amount=32.14, contents="Louisiana chicken bowl", source_image=source, crop_image="200_receipt.jpg",
+        )
+        payment = InvoiceRecord(
+            invoice_date="2026-06-16", seller="REST SS CITAOTINA ESC", currency="MXN", total_amount=256.30,
+            tips=23.30, contents="VENTA CON PROPINA", source_image=source, crop_image="201_card.jpg",
+        )
+
+        paired = pair_invoice_payment_slips([invoice, payment])
+
+        self.assertEqual(len(paired), 1)
+        self.assertEqual(paired[0].total_amount, 256.30)
+        self.assertEqual(paired[0].tips, 23.30)
+        self.assertEqual(paired[0].supporting_crop_images, ["201_card.jpg"])
+
+    def test_exact_tip_does_not_override_different_source_and_merchant(self):
+        invoice = InvoiceRecord(
+            invoice_date="2026-06-16", seller="supersalads", currency="MXN", total_amount=233,
+            vat_amount=32.14, source_image="one.jpg",
+        )
+        payment = InvoiceRecord(
+            invoice_date="2026-06-16", seller="DIFFERENT STORE", currency="MXN", total_amount=256.30,
+            tips=23.30, contents="VENTA CON PROPINA", source_image="two.jpg",
+        )
+
+        self.assertEqual(len(pair_invoice_payment_slips([invoice, payment])), 2)
+
     def test_marks_only_new_same_content_record_as_possible_duplicate(self):
         first = InvoiceRecord(
             invoice_date="2026-06-12",
@@ -193,6 +248,42 @@ class PairingTests(unittest.TestCase):
         self.assertEqual(len(paired), 2)
         self.assertNotIn("Possible duplicate", paired[0].remarks)
         self.assertIn("Possible duplicate", paired[1].remarks)
+
+    def test_missing_date_still_warns_for_same_merchant_currency_and_amount(self):
+        dated = InvoiceRecord(
+            invoice_date="2026-06-06",
+            seller="Nota De Cuenta",
+            currency="MXN",
+            total_amount=150,
+            crop_image="111_old.jpg",
+        )
+        undated = InvoiceRecord(
+            invoice_date="",
+            seller="Nota De Cuenta",
+            currency="MXN",
+            total_amount=150,
+            crop_image="207_new.jpg",
+        )
+
+        self.assertTrue(is_possible_duplicate(dated, undated))
+
+    def test_different_known_dates_are_not_possible_duplicates(self):
+        first = InvoiceRecord(
+            invoice_date="2026-06-06",
+            seller="Nota De Cuenta",
+            currency="MXN",
+            total_amount=150,
+            crop_image="111_old.jpg",
+        )
+        second = InvoiceRecord(
+            invoice_date="2026-06-07",
+            seller="Nota De Cuenta",
+            currency="MXN",
+            total_amount=150,
+            crop_image="207_new.jpg",
+        )
+
+        self.assertFalse(is_possible_duplicate(first, second))
 
     def test_review_mode_marks_possible_pair_without_merging_or_deleting(self):
         payment = InvoiceRecord(
