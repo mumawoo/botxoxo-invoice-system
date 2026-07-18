@@ -4,7 +4,7 @@ import json
 import os
 import subprocess
 import sys
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from datetime import date, datetime
 from pathlib import Path
 
@@ -19,6 +19,7 @@ from invoice_system.telegram_bot import (
     append_process_status,
     change_message,
     delete_message,
+    download_telegram_media,
     format_telegram_config,
     group_message,
     is_allowed_user,
@@ -432,6 +433,41 @@ class TelegramBotTests(unittest.TestCase):
             self.assertIn("- Food: 150.00", text)
             self.assertIn("Queue", text)
             self.assertIn("Review: /excel", text)
+
+    def test_scan_completion_message_explains_automatic_payment_pairing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            settings = Settings(
+                root=root,
+                inbound_dir=root / "data" / "inbound",
+                trial_dir=root / "data" / "trial",
+                output_dir=root / "data" / "output",
+                baseline_dir=root / "data" / "baseline",
+                telegram_allowed_user_ids=frozenset({123}),
+            )
+            record = InvoiceRecord(
+                line_no=37,
+                invoice_date="2026-05-16",
+                expense_category="Food",
+                seller="Las Palmas",
+                total_amount=616.40,
+                tips=80.40,
+                crop_image=str(root / "crops" / "037_2026-05-16_MXN_536.00_Las_Palmas.jpg"),
+                supporting_crop_images=[str(root / "crops" / "163_2026-05-16_MXN_616.40_Las_Palmas.jpg")],
+                remarks="Combined payment slip; tips calculated as 80.40; supporting crop 163 kept",
+            )
+            ReimbursementWorkbook(telegram_user_workbook(settings, 123)).write_records([record])
+            photo = root / "photo.jpg"
+            photo.write_bytes(b"jpg")
+            item = QueueItem(path=str(photo), status=DONE, row_count=1, total_amount=616.40)
+            save_queue_state(telegram_user_queue_path(settings, 123), QueueState([item]))
+
+            text = scan_completion_message(settings, 123, item, [record])
+
+            self.assertIn("Automatic pairing:", text)
+            self.assertIn("163 merged into 037", text)
+            self.assertIn("payment includes tips 80.40", text)
+            self.assertIn("will not be reused", text)
 
     def test_change_message_edits_manual_workbook_by_crop_id(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -975,6 +1011,28 @@ class TelegramBotTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertIn("cancelled", text)
+
+
+class TelegramDownloadRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_download_retries_transient_timeout_then_succeeds(self):
+        timed_out = type("TimedOut", (Exception,), {})
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "photo.jpg"
+            telegram_file = type("TelegramFile", (), {})()
+
+            async def save_file(custom_path):
+                Path(custom_path).write_bytes(b"photo")
+
+            telegram_file.download_to_drive = AsyncMock(side_effect=save_file)
+            bot = type("Bot", (), {})()
+            bot.get_file = AsyncMock(side_effect=[timed_out("network timeout"), telegram_file])
+
+            with patch("invoice_system.telegram_bot.asyncio.sleep", new_callable=AsyncMock) as sleep:
+                await download_telegram_media(bot, "file-id", target)
+
+            self.assertEqual(bot.get_file.await_count, 2)
+            sleep.assert_awaited_once()
+            self.assertEqual(target.read_bytes(), b"photo")
 
 
 if __name__ == "__main__":

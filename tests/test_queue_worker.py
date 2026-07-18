@@ -3,6 +3,7 @@ import unittest
 import json
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from invoice_system.config import Settings
 from invoice_system.grouping import mark_source_for_group_if_armed, arm_next_group
@@ -11,6 +12,7 @@ from invoice_system.queue_worker import (
     DONE,
     FAILED_RETRYABLE,
     PENDING,
+    PROCESSING,
     QueueItem,
     QueueState,
     _workbook_records_for_source,
@@ -20,6 +22,7 @@ from invoice_system.queue_worker import (
     load_queue_state,
     process_user_queue_once,
     prepare_last_photo_rescan,
+    prepare_recent_photos_rescan,
     queue_totals_for_day,
     reset_active_user_workspace,
     retry_failed,
@@ -31,7 +34,7 @@ from invoice_system.queue_worker import (
     telegram_user_queue_path,
     telegram_user_workbook,
 )
-from invoice_system.reimbursement_excel import ReimbursementWorkbook
+from invoice_system.reimbursement_excel import ReimbursementWorkbook, scan_output_workbook_path
 from invoice_system.reimbursement_excel import load_reimbursement_records
 
 
@@ -138,6 +141,74 @@ class QueueWorkerTests(unittest.TestCase):
             self.assertEqual(statuses["good.jpg"], DONE)
             self.assertEqual(statuses["bad.jpg"], PENDING)
 
+    def test_retry_failed_recovers_orphaned_processing_when_worker_stopped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = _settings(Path(temp))
+            queue_path = telegram_user_queue_path(settings, 123)
+            save_queue_state(
+                queue_path,
+                QueueState(
+                    [
+                        QueueItem(path="old.jpg", status=PROCESSING),
+                        QueueItem(path="failed.jpg", status=FAILED_RETRYABLE),
+                        QueueItem(path="done.jpg", status=DONE),
+                    ],
+                    worker_status="stopped",
+                    current_photo="",
+                    last_error="old error",
+                ),
+            )
+
+            count, summary = retry_failed(settings, 123)
+
+            self.assertEqual(count, 2)
+            self.assertEqual(summary.pending, 2)
+            state = load_queue_state(queue_path)
+            self.assertEqual([item.status for item in state.items], [PENDING, PENDING, DONE])
+            self.assertEqual(state.last_error, "")
+
+    def test_retry_failed_does_not_requeue_active_processing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = _settings(Path(temp))
+            queue_path = telegram_user_queue_path(settings, 123)
+            save_queue_state(
+                queue_path,
+                QueueState(
+                    [
+                        QueueItem(path="active.jpg", status=PROCESSING),
+                        QueueItem(path="failed.jpg", status=FAILED_RETRYABLE),
+                    ],
+                    worker_status="running",
+                    current_photo="active.jpg",
+                ),
+            )
+
+            count, summary = retry_failed(settings, 123)
+
+            self.assertEqual(count, 1)
+            self.assertEqual(summary.processing, 1)
+            state = load_queue_state(queue_path)
+            self.assertEqual([item.status for item in state.items], [PROCESSING, PENDING])
+
+    def test_save_queue_state_retries_transient_windows_replace_lock(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "queue_state.json"
+            original_replace = Path.replace
+            attempts = 0
+
+            def flaky_replace(source, target):
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("temporary Windows lock")
+                return original_replace(source, target)
+
+            with patch.object(Path, "replace", new=flaky_replace), patch("invoice_system.queue_worker.time.sleep"):
+                save_queue_state(path, QueueState([QueueItem(path="photo.jpg")]))
+
+            self.assertEqual(attempts, 3)
+            self.assertEqual(load_queue_state(path).items[0].path, "photo.jpg")
+
     def test_worker_notifies_after_each_item(self):
         with tempfile.TemporaryDirectory() as temp:
             settings = _settings(Path(temp))
@@ -220,6 +291,43 @@ class QueueWorkerTests(unittest.TestCase):
             matched = _workbook_records_for_source(output_dir, source, workbook_records)
 
             self.assertEqual([record.line_no for record in matched], [40])
+
+    def test_workbook_records_for_source_matches_new_supporting_crop_to_old_primary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = _settings(Path(temp))
+            output_dir = telegram_user_output_dir(settings, 123)
+            source = telegram_user_day_dir(settings, 123) / "payment.jpg"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"jpg")
+            primary = output_dir / "crops" / "187_2026-06-17_MXN_339.00_Carls_Jr.jpg"
+            support = output_dir / "crops" / "208_2026-06-17_MXN_339.00_Carls_Jr_card.jpg"
+            (output_dir / "processing_state.json").parent.mkdir(parents=True, exist_ok=True)
+            (output_dir / "processing_state.json").write_text(
+                json.dumps(
+                    {
+                        "records": [
+                            {
+                                "source_image": str(source),
+                                "crop_image": str(support),
+                                "supporting_crop_images": [],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            workbook_records = [
+                InvoiceRecord(
+                    line_no=187,
+                    crop_image=str(primary),
+                    supporting_crop_images=[str(support)],
+                    total_amount=339,
+                )
+            ]
+
+            matched = _workbook_records_for_source(output_dir, source, workbook_records)
+
+            self.assertEqual([record.line_no for record in matched], [187])
 
     def test_reset_active_user_workspace_archives_inbound_output_and_clears_queue(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -467,6 +575,11 @@ class QueueWorkerTests(unittest.TestCase):
             self.assertEqual(processing["next_crop_id"], 2)
             workbook_records = load_reimbursement_records(telegram_user_workbook(settings, 123))
             self.assertEqual([record.seller for record in workbook_records], ["Cafe"])
+            scan_records = load_reimbursement_records(scan_output_workbook_path(output_dir))
+            self.assertEqual(len(scan_records), 1)
+            self.assertEqual(scan_records[0].line_no, 1)
+            self.assertTrue(Path(scan_records[0].crop_image).name.startswith("001_"))
+            self.assertEqual(processing["next_crop_id"], 2)
 
     def test_prepare_last_photo_rescan_preserves_source_and_requeues(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -509,6 +622,57 @@ class QueueWorkerTests(unittest.TestCase):
             self.assertEqual(processing["records"], [])
             self.assertEqual(processing["completed_sources"], [])
             self.assertEqual(processing["next_crop_id"], 1)
+
+    def test_prepare_recent_photos_rescan_resets_two_sources_together(self):
+        with tempfile.TemporaryDirectory() as temp:
+            settings = _settings(Path(temp))
+            output_dir = telegram_user_output_dir(settings, 123)
+            photos = [telegram_user_day_dir(settings, 123) / name for name in ("one.jpg", "two.jpg")]
+            for photo in photos:
+                photo.parent.mkdir(parents=True, exist_ok=True)
+                photo.write_bytes(photo.name.encode())
+            crops = output_dir / "crops"
+            crops.mkdir(parents=True)
+            crop_paths = [crops / "026_a.jpg", crops / "027_b.jpg"]
+            for crop in crop_paths:
+                crop.write_bytes(b"crop")
+            ReimbursementWorkbook(telegram_user_workbook(settings, 123)).write_records(
+                [
+                    InvoiceRecord(line_no=26, invoice_date="2026-07-01", total_amount=10, seller="A", crop_image=str(crop_paths[0]), source_image=str(photos[0])),
+                    InvoiceRecord(line_no=27, invoice_date="2026-07-02", total_amount=20, seller="B", crop_image=str(crop_paths[1]), source_image=str(photos[1])),
+                ]
+            )
+            (output_dir / "processing_state.json").write_text(
+                json.dumps(
+                    {
+                        "completed_sources": [str(photo) for photo in photos],
+                        "records": [
+                            {"source_image": str(photo), "crop_image": str(crop), "supporting_crop_images": []}
+                            for photo, crop in zip(photos, crop_paths)
+                        ],
+                        "audits": [],
+                        "source_qas": [],
+                        "source_hashes": [],
+                        "next_crop_id": 28,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            save_queue_state(
+                telegram_user_queue_path(settings, 123),
+                QueueState([QueueItem(str(photo), status=DONE) for photo in photos]),
+                preserve_concurrent=False,
+            )
+
+            summaries = prepare_recent_photos_rescan(settings, 123, 2)
+
+            self.assertEqual([summary.trace_ids for summary in summaries], [("026",), ("027",)])
+            self.assertTrue(all(photo.exists() for photo in photos))
+            self.assertTrue(all(not crop.exists() for crop in crop_paths))
+            state = load_queue_state(telegram_user_queue_path(settings, 123))
+            self.assertEqual([item.status for item in state.items], [PENDING, PENDING])
+            processing = json.loads((output_dir / "processing_state.json").read_text(encoding="utf-8"))
+            self.assertEqual(processing["records"], [])
 
 
 class FakeQueuePipeline:

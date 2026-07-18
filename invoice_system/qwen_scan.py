@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import urllib.error
 import urllib.request
 from io import BytesIO
@@ -54,8 +55,7 @@ class QwenScanRecognizer:
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(request, timeout=120) as response:
-                body = response.read().decode("utf-8")
+            body = _open_qwen_with_retry(request)
             text = _extract_message_content(json.loads(body))
             result = _ocr_result_from_response_text(text, self.engine)
             if result.error:
@@ -66,6 +66,22 @@ class QwenScanRecognizer:
             return OCRResult(self.engine, error=f"Qwen HTTP {exc.code}: {detail}")
         except Exception as exc:
             return OCRResult(self.engine, error=str(exc))
+
+
+def _open_qwen_with_retry(request: urllib.request.Request) -> str:
+    delays = (2, 5)
+    for attempt in range(len(delays) + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                return response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            transient = exc.code in {429, 500, 502, 503, 504} or "throttl" in detail.casefold() or "serviceunavailable" in detail.casefold()
+            if transient and attempt < len(delays):
+                time.sleep(delays[attempt])
+                continue
+            raise RuntimeError(f"Qwen HTTP {exc.code}: {detail}") from exc
+    raise RuntimeError("Qwen request failed after retries")
 
 
 def _extract_message_content(data: object) -> str:

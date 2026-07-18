@@ -322,6 +322,13 @@ def _archive_active_outputs(settings: Settings, user_id: int, batch_id: str) -> 
         shutil.copytree(review_crops, archived_review_crops)
         if review_saved is None:
             review_saved = archived_review_crops
+    system_dir = output_dir / "system"
+    if system_dir.exists():
+        archived_system = archive_dir / "manual_check" / "system"
+        if archived_system.exists():
+            shutil.rmtree(archived_system)
+        archived_system.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(system_dir, archived_system)
     for name in ("processing_state.json", "queue_state.json"):
         path = output_dir / name
         if path.exists():
@@ -347,7 +354,7 @@ def _reset_active_scan_outputs(settings: Settings, user_id: int) -> None:
         path = output_dir / name
         if path.exists():
             path.unlink()
-    for folder in ("crops", "final_crops", "checked_baseline", REVIEW_CROPS_DIR):
+    for folder in ("crops", "final_crops", "checked_baseline", REVIEW_CROPS_DIR, "system"):
         path = output_dir / folder
         if path.exists():
             shutil.rmtree(path)

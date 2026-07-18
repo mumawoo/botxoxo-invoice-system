@@ -15,7 +15,9 @@ from invoice_system.image_splitter import (
     _overlaps,
     _pad_box,
     _parse_tesseract_rotate,
+    _prefer_paper_boxes,
     _same_receipt_fragment,
+    _single_box_is_suspicious_inner_frame,
     _upright_text_score,
     _windows_path_to_wsl,
 )
@@ -88,6 +90,20 @@ class ImageSplitterTests(unittest.TestCase):
 
         self.assertEqual(padded, (70, 40, 330, 560))
         self.assertEqual(_pad_box((5, 5, 100, 100), width=120, height=120, ratio=0.15), (0, 0, 114, 114))
+
+    def test_paper_boxes_win_when_same_count_but_cover_complete_receipts(self):
+        edge_boxes = [(999, 260, 1577, 1981), (366, 1826, 824, 2145)]
+        paper_boxes = [(0, 198, 824, 2144), (1000, 252, 1575, 2000)]
+
+        self.assertTrue(_prefer_paper_boxes(edge_boxes, paper_boxes, 1920 * 2560))
+
+    def test_small_single_inner_frame_falls_back_to_full_image(self):
+        image_area = 960 * 1280
+        total_box = [(240, 705, 665, 864)]
+
+        self.assertTrue(_single_box_is_suspicious_inner_frame(total_box, [], image_area))
+        self.assertFalse(_single_box_is_suspicious_inner_frame(total_box, [(190, 370, 710, 980)], image_area))
+        self.assertFalse(_single_box_is_suspicious_inner_frame([(100, 100, 700, 700)], [], image_area))
 
     def test_normalize_crop_rotates_landscape_and_scales_minimum_to_1500(self):
         import cv2
@@ -247,7 +263,10 @@ class ImageSplitterTests(unittest.TestCase):
         self.assertLessEqual(681 * _ocr_scale_factor(681, 324), 2600)
 
     def test_windows_path_to_wsl(self):
-        self.assertEqual(_windows_path_to_wsl(Path(r"C:\Users\donxi\AppData\Local\Temp\crop.png")), "/mnt/c/Users/donxi/AppData/Local/Temp/crop.png")
+        self.assertEqual(
+            _windows_path_to_wsl(Path(r"C:\Users\example\AppData\Local\Temp\crop.png")),
+            "/mnt/c/Users/example/AppData/Local/Temp/crop.png",
+        )
 
 
 if __name__ == "__main__":

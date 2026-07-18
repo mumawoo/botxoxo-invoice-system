@@ -133,6 +133,40 @@ class QwenScanTests(unittest.TestCase):
         self.assertEqual(result.error, "")
         self.assertEqual(result.parsed_invoice.invoice_date, "2026-05-10")
 
+    def test_qwen_default_remark_does_not_claim_codex_was_used(self):
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "invoice_date": "2026-06-12",
+                                "currency": "MXN",
+                                "total_amount": 126,
+                                "seller": "Cafe Xuan",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            image = Path(temp) / "receipt.jpg"
+            _write_test_image(image)
+            recognizer = QwenScanRecognizer(
+                Settings(
+                    qwen_api_key="token",
+                    qwen_scan_enabled=True,
+                    qwen_base_url="https://example.test/chat/completions",
+                )
+            )
+
+            with patch("invoice_system.qwen_scan.urllib.request.urlopen", return_value=FakeResponse(response)):
+                result = recognizer.recognize(image)
+
+        self.assertEqual(result.parsed_invoice.remarks, "Qwen Scan used")
+        self.assertNotIn("Codex", result.parsed_invoice.remarks)
+
 
 class FakeResponse:
     def __init__(self, payload: dict) -> None:

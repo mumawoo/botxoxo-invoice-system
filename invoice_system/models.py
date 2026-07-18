@@ -147,6 +147,7 @@ class PipelineSummary:
     crops: int
     records_written: int
     workbook_path: Path
+    review_warnings: tuple[str, ...] = ()
 
 
 @dataclass

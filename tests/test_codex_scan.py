@@ -56,10 +56,19 @@ class CodexScanTests(unittest.TestCase):
 
         self.assertEqual(record.expense_category, "Food")
 
-    def test_record_allows_missing_date_for_neighbor_fill(self):
+    def test_record_allows_missing_date_to_remain_blank(self):
         record = _record_from_json('{"seller":"CAFE XUAN","total_amount":126}')
 
         self.assertEqual(record.invoice_date, "")
+
+    def test_unlabeled_handwritten_line_is_not_treated_as_tip(self):
+        record = _record_from_json(
+            '{"seller":"Nota De Cuenta","currency":"MXN","contents":"2 papas, 2 refrescos",'
+            '"total_amount":170,"expense_amount":140,"tips":30}'
+        )
+
+        self.assertEqual(record.total_amount, 140)
+        self.assertEqual(record.tips, 0)
 
     def test_record_rejects_missing_required_fields(self):
         with self.assertRaisesRegex(ValueError, "seller"):

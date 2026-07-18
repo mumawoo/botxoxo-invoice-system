@@ -61,8 +61,10 @@ class OpenCVInvoiceSplitter:
 
         boxes = _merge_boxes(boxes)
         paper_boxes = _paper_region_boxes(image, cv2, np)
-        if len(paper_boxes) > len(boxes) and (len(boxes) <= 1 or _box_area(boxes[0]) >= image_area * 0.18):
+        if _prefer_paper_boxes(boxes, paper_boxes, image_area):
             boxes = paper_boxes
+        elif _single_box_is_suspicious_inner_frame(boxes, paper_boxes, image_area):
+            return [self._copy_original(image_path, 1)]
         if not boxes:
             return [self._copy_original(image_path, 1)]
 
@@ -205,6 +207,36 @@ def _intersection_area(a: tuple[int, int, int, int], b: tuple[int, int, int, int
 
 def _box_area(box: tuple[int, int, int, int]) -> int:
     return max(box[2] - box[0], 0) * max(box[3] - box[1], 0)
+
+
+def _prefer_paper_boxes(
+    edge_boxes: list[tuple[int, int, int, int]],
+    paper_boxes: list[tuple[int, int, int, int]],
+    image_area: int,
+) -> bool:
+    if not paper_boxes:
+        return False
+    if len(paper_boxes) > len(edge_boxes) and (
+        len(edge_boxes) <= 1 or _box_area(edge_boxes[0]) >= image_area * 0.18
+    ):
+        return True
+    if len(paper_boxes) != len(edge_boxes) or not edge_boxes:
+        return False
+    edge_coverage = sum(_box_area(box) for box in edge_boxes)
+    paper_coverage = sum(_box_area(box) for box in paper_boxes)
+    return paper_coverage >= edge_coverage * 1.35
+
+
+def _single_box_is_suspicious_inner_frame(
+    edge_boxes: list[tuple[int, int, int, int]],
+    paper_boxes: list[tuple[int, int, int, int]],
+    image_area: int,
+) -> bool:
+    """Avoid treating a small total/payment box as the complete receipt."""
+
+    if paper_boxes or len(edge_boxes) != 1 or image_area <= 0:
+        return False
+    return _box_area(edge_boxes[0]) < image_area * 0.12
 
 
 def _union(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> tuple[int, int, int, int]:

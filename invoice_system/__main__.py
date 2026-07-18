@@ -57,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild = sub.add_parser("rebuild-final-crops", help="Force rebuild checked Excel and final_crops cache.")
     rebuild.add_argument("--user-id", type=int, required=True, help="Telegram user ID.")
 
+    repair = sub.add_parser("repair-review", help="Preview or explicitly confirm a full Review workbook reconstruction.")
+    repair.add_argument("--user-id", type=int, required=True, help="Telegram user ID.")
+    repair_action = repair.add_mutually_exclusive_group(required=True)
+    repair_action.add_argument("--preview", action="store_true", help="Archive Review and preview differences only.")
+    repair_action.add_argument("--confirm", metavar="PREVIEW_ID", help="Apply an unchanged preview by its explicit ID.")
+
     compare = sub.add_parser("compare", help="Compare Windows output with Ubuntu baseline output.")
     compare.add_argument("--baseline", type=Path, required=True)
     compare.add_argument("--candidate", type=Path, required=True)
@@ -163,6 +169,29 @@ def main(argv: list[str] | None = None) -> int:
         if result.missing_crops:
             print(f"Missing crops: {len(result.missing_crops)}")
             return 1
+        return 0
+
+    if args.command == "repair-review":
+        from .pipeline import load_processing_records
+        from .queue_worker import telegram_user_output_dir
+        from .reimbursement_excel import confirm_review_repair, preview_review_repair
+
+        output_dir = telegram_user_output_dir(settings, args.user_id)
+        records = load_processing_records(output_dir)
+        try:
+            if args.preview:
+                preview = preview_review_repair(output_dir, records, settings.pairing_mode)
+                print(f"Repair preview ID: {preview.preview_id}")
+                print(f"Archive: {preview.directory}")
+                print(f"Added/removed/changed Trace IDs: {preview.added}/{preview.removed}/{preview.changed}")
+                print(f"Report: {preview.report_path}")
+                print(f"To apply exactly this preview: python -m invoice_system repair-review --user-id {args.user_id} --confirm {preview.preview_id}")
+                return 0
+            repaired = confirm_review_repair(output_dir, args.confirm, records)
+        except (FileNotFoundError, PermissionError, RuntimeError, ValueError) as exc:
+            print(f"Review repair error: {exc}", file=sys.stderr)
+            return 1
+        print(f"Review reconstructed from confirmed preview: {repaired}")
         return 0
 
     if args.command == "compare":

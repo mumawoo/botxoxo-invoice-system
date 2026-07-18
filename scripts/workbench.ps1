@@ -5,6 +5,9 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $ScriptDir
 $EnvFile = Join-Path $ProjectRoot ".env"
+$ProjectVenv = Join-Path $ProjectRoot ".venv"
+$ProjectPython = Join-Path $ProjectVenv "Scripts\python.exe"
+$UseExplicitPython = [bool]($env:INVOICE_SYSTEM_PYTHON -and (Test-Path -LiteralPath $env:INVOICE_SYSTEM_PYTHON))
 
 function Get-DotEnvValue {
     param([string]$Name)
@@ -20,8 +23,11 @@ function Get-DotEnvValue {
 }
 
 function Get-DefaultPython {
-    if ($env:INVOICE_SYSTEM_PYTHON -and (Test-Path -LiteralPath $env:INVOICE_SYSTEM_PYTHON)) {
+    if ($UseExplicitPython) {
         return $env:INVOICE_SYSTEM_PYTHON
+    }
+    if (Test-Path -LiteralPath $ProjectPython) {
+        return $ProjectPython
     }
     $codexPython = Join-Path $env:USERPROFILE ".cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe"
     if (Test-Path -LiteralPath $codexPython) {
@@ -70,15 +76,22 @@ $ProjectLabel.AutoSize = $true
 $ProjectLabel.Location = New-Object System.Drawing.Point(20, 52)
 $Form.Controls.Add($ProjectLabel)
 
+$RuntimeLabel = New-Object System.Windows.Forms.Label
+$RuntimeLabel.Text = "Runtime: $Python"
+$RuntimeLabel.AutoSize = $true
+$RuntimeLabel.Location = New-Object System.Drawing.Point(20, 73)
+$RuntimeLabel.ForeColor = [System.Drawing.Color]::FromArgb(75, 85, 99)
+$Form.Controls.Add($RuntimeLabel)
+
 $UserLabel = New-Object System.Windows.Forms.Label
 $UserLabel.Text = "Telegram user ID:"
 $UserLabel.AutoSize = $true
-$UserLabel.Location = New-Object System.Drawing.Point(20, 86)
+$UserLabel.Location = New-Object System.Drawing.Point(20, 106)
 $Form.Controls.Add($UserLabel)
 
 $UserBox = New-Object System.Windows.Forms.TextBox
 $UserBox.Text = $DefaultUserId
-$UserBox.Location = New-Object System.Drawing.Point(150, 82)
+$UserBox.Location = New-Object System.Drawing.Point(150, 102)
 $UserBox.Size = New-Object System.Drawing.Size(180, 28)
 $Form.Controls.Add($UserBox)
 
@@ -138,6 +151,39 @@ function Get-MissingPythonModules {
     return @($output -split "," | Where-Object { $_ })
 }
 
+function Ensure-ProjectRuntime {
+    if ($UseExplicitPython) {
+        return $true
+    }
+    if (Test-Path -LiteralPath $ProjectPython) {
+        $script:Python = $ProjectPython
+        $RuntimeLabel.Text = "Runtime: $ProjectPython"
+        return $true
+    }
+
+    $bootstrapPython = $Python
+    $Status.Text = "Creating stable project runtime at $ProjectVenv ..."
+    try {
+        & $bootstrapPython -m venv $ProjectVenv
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $ProjectPython)) {
+            throw "Python venv creation failed."
+        }
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Could not create the stable project runtime:`n$ProjectVenv`n`n$($_.Exception.Message)",
+            "Runtime setup failed",
+            "OK",
+            "Error"
+        ) | Out-Null
+        $Status.Text = "Runtime setup failed."
+        return $false
+    }
+    $script:Python = $ProjectPython
+    $RuntimeLabel.Text = "Runtime: $ProjectPython"
+    $Status.Text = "Stable project runtime created. Checking packages..."
+    return $true
+}
+
 function Start-DependencyInstall {
     param([string[]]$MissingModules)
     $packageMap = @{
@@ -168,6 +214,9 @@ function Start-DependencyInstall {
 }
 
 function Assert-TelegramDependency {
+    if (-not (Ensure-ProjectRuntime)) {
+        return $false
+    }
     $missing = @(Get-MissingPythonModules -Modules @("telegram"))
     if ($missing.Count -eq 0) {
         return $true
@@ -176,6 +225,9 @@ function Assert-TelegramDependency {
 }
 
 function Assert-ProcessingDependencies {
+    if (-not (Ensure-ProjectRuntime)) {
+        return $false
+    }
     $missing = @(Get-MissingPythonModules -Modules @("telegram", "cv2", "PIL", "numpy", "openpyxl"))
     if ($missing.Count -eq 0) {
         return $true
@@ -410,8 +462,8 @@ function Add-Button {
 }
 
 $Tabs = New-Object System.Windows.Forms.TabControl
-$Tabs.Location = New-Object System.Drawing.Point(20, 130)
-$Tabs.Size = New-Object System.Drawing.Size(800, 380)
+$Tabs.Location = New-Object System.Drawing.Point(20, 145)
+$Tabs.Size = New-Object System.Drawing.Size(800, 365)
 $Tabs.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 $Form.Controls.Add($Tabs)
 

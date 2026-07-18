@@ -108,6 +108,57 @@ def pair_invoice_payment_slips(records: list[InvoiceRecord], mode: str = "auto")
     return output
 
 
+def is_confident_invoice_payment_pair(invoice: InvoiceRecord, payment: InvoiceRecord) -> bool:
+    """Return whether two records can be safely paired in that direction."""
+
+    return (
+        _looks_like_invoice(invoice)
+        and _looks_like_payment_slip(payment)
+        and _pair_context_matches(invoice, payment)
+        and _confident_payment_pair(invoice, payment)
+    )
+
+
+def is_possible_duplicate(left: InvoiceRecord, right: InvoiceRecord) -> bool:
+    """Return whether two invoice records require duplicate review."""
+
+    return _possible_duplicate(left, right)
+
+
+def mark_possible_matches_with_protected(
+    records: list[InvoiceRecord], protected_records: list[InvoiceRecord]
+) -> list[InvoiceRecord]:
+    """Warn about protected matches without changing or absorbing either record."""
+
+    for record in records:
+        for protected in protected_records:
+            protected_id = _record_trace_label(protected)
+            if _same_context(protected, record):
+                if _looks_like_invoice(protected) and _looks_like_payment_slip(record) and _confident_payment_pair(protected, record):
+                    delta = round(record.total_amount - protected.total_amount, 2)
+                    _append_remark(
+                        record,
+                        f"Possible pair with protected crop {protected_id}: same date, merchant and currency; "
+                        f"payment difference {delta:.2f}; human review required",
+                    )
+                    break
+                if _looks_like_invoice(record) and _looks_like_payment_slip(protected) and _confident_payment_pair(record, protected):
+                    delta = round(protected.total_amount - record.total_amount, 2)
+                    _append_remark(
+                        record,
+                        f"Possible pair with protected crop {protected_id}: same date, merchant and currency; "
+                        f"payment difference {delta:.2f}; human review required",
+                    )
+                    break
+            if is_possible_duplicate(protected, record):
+                _append_remark(
+                    record,
+                    f"Possible duplicate with protected crop {protected_id}; human review required",
+                )
+                break
+    return records
+
+
 def _suggest_pairs_for_review(records: list[InvoiceRecord]) -> list[InvoiceRecord]:
     paired_indexes: set[int] = set()
     groups: list[tuple[int, int]] = []
@@ -148,7 +199,7 @@ def _find_payment_slip(
     for index, candidate in enumerate(records):
         if index == invoice_index or index in used:
             continue
-        if not _same_context(invoice, candidate):
+        if not _pair_context_matches(invoice, candidate):
             continue
         if not _looks_like_payment_slip(candidate):
             continue
@@ -162,6 +213,17 @@ def _find_payment_slip(
 
 def _merge_payment_slip(invoice: InvoiceRecord, payment: InvoiceRecord) -> None:
     amount_delta = round(payment.total_amount - invoice.total_amount, 2)
+    supporting_id = _crop_trace_id(payment.crop_image)
+    supporting_note = f"supporting crop {supporting_id} kept" if supporting_id else "supporting crop kept"
+    invoice.report_components = bool(
+        invoice.report_components
+        or payment.report_components
+        or invoice.vat_amount
+        or payment.vat_amount
+        or invoice.tips
+        or payment.tips
+        or amount_delta > 0.50
+    )
     _append_supporting_crop(invoice, payment.crop_image)
     for crop_image in getattr(payment, "supporting_crop_images", []) or []:
         _append_supporting_crop(invoice, crop_image)
@@ -169,9 +231,14 @@ def _merge_payment_slip(invoice: InvoiceRecord, payment: InvoiceRecord) -> None:
         invoice.tips = max(invoice.tips, amount_delta)
         invoice.total_amount = payment.total_amount
         invoice.expense_amount = max(invoice.total_amount - invoice.vat_amount - invoice.sales_tax, 0.0)
-        _append_remark(invoice, f"Combined payment slip; tips calculated as {amount_delta:.2f}; supporting crop kept")
+        _append_remark(invoice, f"Combined payment slip; tips calculated as {amount_delta:.2f}; {supporting_note}")
     else:
-        _append_remark(invoice, "Combined duplicate payment slip; supporting crop kept")
+        _append_remark(invoice, f"Combined duplicate payment slip; {supporting_note}")
+
+
+def _crop_trace_id(crop_image: str) -> str:
+    match = re.match(r"(\d{3,})", Path(crop_image).name)
+    return match.group(1) if match else ""
 
 
 def _mark_possible_pair(invoice: InvoiceRecord, payment: InvoiceRecord, group_id: str) -> None:
@@ -190,6 +257,22 @@ def _same_context(left: InvoiceRecord, right: InvoiceRecord) -> bool:
         and _same_currency(left.currency, right.currency)
         and _same_merchant_context(left, right)
     )
+
+
+def _pair_context_matches(invoice: InvoiceRecord, payment: InvoiceRecord) -> bool:
+    if not _same_date(invoice.invoice_date, payment.invoice_date) or not _same_currency(invoice.currency, payment.currency):
+        return False
+    return _same_merchant_context(invoice, payment) or _same_source_exact_tip(invoice, payment)
+
+
+def _same_source_exact_tip(invoice: InvoiceRecord, payment: InvoiceRecord) -> bool:
+    invoice_source = str(invoice.source_image or "").strip().casefold()
+    payment_source = str(payment.source_image or "").strip().casefold()
+    if not invoice_source or invoice_source != payment_source:
+        return False
+    delta = round(float(payment.total_amount or 0) - float(invoice.total_amount or 0), 2)
+    reported_tip = round(float(payment.tips or 0), 2)
+    return delta > 0.50 and reported_tip > 0 and abs(delta - reported_tip) <= 0.50
 
 
 def _same_date(left: str, right: str) -> bool:
@@ -299,21 +382,21 @@ def _append_supporting_crop(record: InvoiceRecord, crop_image: str) -> None:
 
 
 def _mark_possible_duplicate_invoices(records: list[InvoiceRecord]) -> None:
-    seen: dict[tuple[object, ...], InvoiceRecord] = {}
-    for record in records:
-        key = _duplicate_key(record)
-        existing = seen.get(key)
-        if existing is None:
-            seen[key] = record
-            continue
-        if not _possible_duplicate(existing, record):
-            continue
-        existing_id = _record_trace_label(existing)
-        _append_remark(record, f"Possible duplicate with {existing_id}; human review required")
+    for index, record in enumerate(records):
+        for existing in records[:index]:
+            if not _possible_duplicate(existing, record):
+                continue
+            existing_id = _record_trace_label(existing)
+            _append_remark(record, f"Possible duplicate with {existing_id}; human review required")
+            break
 
 
 def _possible_duplicate(left: InvoiceRecord, right: InvoiceRecord) -> bool:
-    if _duplicate_key(left) != _duplicate_key(right):
+    if _duplicate_core_key(left) != _duplicate_core_key(right):
+        return False
+    left_date = normalize_date(left.invoice_date) or (left.invoice_date or "").strip()[:10]
+    right_date = normalize_date(right.invoice_date) or (right.invoice_date or "").strip()[:10]
+    if left_date and right_date and left_date != right_date:
         return False
     left_id = _record_trace_key(left)
     right_id = _record_trace_key(right)
@@ -323,6 +406,12 @@ def _possible_duplicate(left: InvoiceRecord, right: InvoiceRecord) -> bool:
 def _duplicate_key(record: InvoiceRecord) -> tuple[object, ...]:
     return (
         normalize_date(record.invoice_date) or (record.invoice_date or "").strip()[:10],
+        *_duplicate_core_key(record),
+    )
+
+
+def _duplicate_core_key(record: InvoiceRecord) -> tuple[object, ...]:
+    return (
         normalize_text(record.seller).casefold(),
         _normalize_currency(record.currency),
         round(record.total_amount, 2),

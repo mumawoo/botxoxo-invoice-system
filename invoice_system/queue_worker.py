@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import threading
+import time
 from dataclasses import replace
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -20,8 +22,9 @@ from .pipeline import InvoicePipeline
 from .reimbursement_excel import (
     apply_reimbursement_group,
     next_manual_trace_id,
+    rebuild_scan_output,
     reimbursement_workbook_path,
-    remove_reimbursement_rows_by_trace_ids,
+    reverse_review_sync_for_source,
 )
 
 PENDING = "pending"
@@ -50,6 +53,7 @@ class QueueItem:
     file_size: int = 0
     upload_quality: str = "unknown"
     detected_receipt_count: int = 0
+    needs_human_review: bool = False
 
 
 @dataclass
@@ -216,12 +220,18 @@ def retry_failed(settings: Settings, user_id: int) -> tuple[int, QueueSummary]:
     state = load_queue_state(queue_path)
     count = 0
     now = _timestamp()
+    recover_orphaned_processing = state.worker_status != "running" and not state.current_photo
     for item in state.items:
-        if item.status == FAILED_RETRYABLE:
+        if item.status == FAILED_RETRYABLE or (recover_orphaned_processing and item.status == PROCESSING):
             item.status = PENDING
             item.error = ""
             item.updated_at = now
             count += 1
+    if count:
+        state.last_error = ""
+        state.worker_status = "stopped"
+        state.current_photo = ""
+        state.updated_at = now
     save_queue_state(queue_path, state)
     return count, summarize_queue(settings, user_id)
 
@@ -273,9 +283,11 @@ def rollback_last_photo(settings: Settings, user_id: int) -> RollbackSummary:
     paths_to_delete = _rollback_paths_for_source(output_dir, photo_path, processing_data, target_records, trace_ids)
     photo_hash = _file_sha256(photo_path)
     _remove_source_from_processing_data(processing_data, photo_path, photo_hash)
-    manual_rows_deleted = remove_reimbursement_rows_by_trace_ids(output_dir, set(trace_ids))
+    reverse_result = reverse_review_sync_for_source(output_dir, photo_path, set(trace_ids))
+    manual_rows_deleted = reverse_result.removed_rows
     processing_data["next_crop_id"] = _next_trace_after_rollback(output_dir, processing_data)
     _save_processing_data(processing_path, processing_data)
+    rebuild_scan_output(output_dir, _processing_records(processing_data), settings.pairing_mode)
     removed = _remove_queue_item_at(state, index)
     if not any(existing.status == FAILED_RETRYABLE for existing in state.items):
         state.last_error = ""
@@ -325,9 +337,11 @@ def prepare_last_photo_rescan(settings: Settings, user_id: int) -> RescanSummary
         ]
         photo_hash = _file_sha256(photo_path)
         _remove_source_from_processing_data(processing_data, photo_path, photo_hash)
-        manual_rows_deleted = remove_reimbursement_rows_by_trace_ids(output_dir, set(trace_ids))
+        reverse_result = reverse_review_sync_for_source(output_dir, photo_path, set(trace_ids))
+        manual_rows_deleted = reverse_result.removed_rows
         processing_data["next_crop_id"] = _next_trace_after_rollback(output_dir, processing_data)
         _save_processing_data(processing_path, processing_data)
+        rebuild_scan_output(output_dir, _processing_records(processing_data), settings.pairing_mode)
 
     item.status = PENDING
     item.error = ""
@@ -337,6 +351,7 @@ def prepare_last_photo_rescan(settings: Settings, user_id: int) -> RescanSummary
     item.category_totals = {}
     item.workbook_path = ""
     item.detected_receipt_count = 0
+    item.needs_human_review = False
     item.updated_at = _timestamp()
     state.current_photo = ""
     state.worker_status = "stopped"
@@ -345,6 +360,79 @@ def prepare_last_photo_rescan(settings: Settings, user_id: int) -> RescanSummary
     save_queue_state(queue_path, state, preserve_concurrent=False)
     crop_files_deleted = _delete_paths(paths_to_delete)
     return RescanSummary(user_id, photo_path, tuple(trace_ids), manual_rows_deleted, crop_files_deleted, True)
+
+
+def prepare_recent_photos_rescan(settings: Settings, user_id: int, count: int) -> tuple[RescanSummary, ...]:
+    """Safely reset the most recent queue items while preserving their source photos."""
+
+    if count < 1:
+        raise ValueError("Rescan count must be at least 1")
+    queue_path = telegram_user_queue_path(settings, user_id)
+    output_dir = telegram_user_output_dir(settings, user_id)
+    state = load_queue_state(queue_path)
+    if len(state.items) < count:
+        raise LookupError(f"Only {len(state.items)} Telegram photo(s) are available to rescan")
+    if state.worker_status == "running" or state.current_photo or any(item.status == PROCESSING for item in state.items):
+        raise RuntimeError("Queue is processing. Wait for scanning to finish before rescanning recent photos.")
+    targets = state.items[-count:]
+    if any(item.status not in {PENDING, DONE, FAILED_RETRYABLE} for item in targets):
+        raise RuntimeError("One or more recent photos cannot be rescanned in their current status")
+
+    _assert_writable(telegram_user_workbook(settings, user_id))
+    processing_path = output_dir / "processing_state.json"
+    processing_data = _load_processing_data(processing_path)
+    records = [record for record in processing_data.get("records", []) if isinstance(record, dict)]
+    paths_to_delete: list[Path] = []
+    target_details: list[tuple[QueueItem, Path, list[str]]] = []
+    manual_rows_deleted = 0
+    for item in targets:
+        photo_path = Path(item.path)
+        source_key = _path_key(photo_path)
+        target_records = [
+            record for record in records if _path_key(Path(str(record.get("source_image") or ""))) == source_key
+        ]
+        trace_ids = sorted({crop_id for record in target_records for crop_id in _crop_ids_from_processing_record(record)})
+        if target_records and trace_ids:
+            reverse_result = reverse_review_sync_for_source(output_dir, photo_path, set(trace_ids))
+            manual_rows_deleted += reverse_result.removed_rows
+            paths_to_delete.extend(
+                path
+                for path in _rollback_paths_for_source(output_dir, photo_path, processing_data, target_records, trace_ids)
+                if _path_key(path) != source_key
+            )
+            _remove_source_from_processing_data(processing_data, photo_path, _file_sha256(photo_path))
+        target_details.append((item, photo_path, trace_ids))
+
+    processing_data["next_crop_id"] = _next_trace_after_rollback(output_dir, processing_data)
+    _save_processing_data(processing_path, processing_data)
+    rebuild_scan_output(output_dir, _processing_records(processing_data), settings.pairing_mode)
+    for item, _, _ in target_details:
+        item.status = PENDING
+        item.error = ""
+        item.crop_count = 0
+        item.row_count = 0
+        item.total_amount = 0.0
+        item.category_totals = {}
+        item.workbook_path = ""
+        item.detected_receipt_count = 0
+        item.needs_human_review = False
+        item.updated_at = _timestamp()
+    state.current_photo = ""
+    state.worker_status = "stopped"
+    state.last_error = ""
+    save_queue_state(queue_path, state, preserve_concurrent=False)
+    deleted_count = _delete_paths(list(dict.fromkeys(paths_to_delete)))
+    return tuple(
+        RescanSummary(
+            user_id,
+            photo_path,
+            tuple(trace_ids),
+            manual_rows_deleted if index == 0 else 0,
+            deleted_count if index == 0 else 0,
+            True,
+        )
+        for index, (_, photo_path, trace_ids) in enumerate(target_details)
+    )
 
 
 QueueItemCallback = Callable[[int, QueueItem, list[InvoiceRecord]], None]
@@ -396,15 +484,35 @@ def process_user_queue_once(
                     else:
                         item.error = "Group requested, but fewer than two crop records were found"
                         clear_forced_group_source(output_dir, Path(item.path))
-                item.status = DONE
-                item.crop_count = max(summary.crops, item.crop_count)
-                item.row_count = len(new_records)
-                item.total_amount = round(sum(record.total_amount for record in new_records), 2)
-                item.category_totals = _category_totals(new_records)
-                item.workbook_path = str(summary.workbook_path)
-                item.detected_receipt_count = _detected_receipt_count(output_dir, Path(item.path))
-                if after <= before and before > 0:
-                    item.error = "Already completed in processing checkpoint"
+                transient_error = _source_transient_qwen_error(output_dir, Path(item.path))
+                if transient_error:
+                    _discard_source_results_for_retry(settings, user_id, output_dir, Path(item.path))
+                    item.status = FAILED_RETRYABLE
+                    item.error = "Qwen service is temporarily busy. The photo was kept; use /restart to retry."
+                    item.row_count = 0
+                    item.total_amount = 0.0
+                    item.category_totals = {}
+                    item.workbook_path = ""
+                    item.crop_count = 0
+                    item.detected_receipt_count = 0
+                    item.needs_human_review = False
+                    new_records = []
+                else:
+                    item.status = DONE
+                    item.row_count = len(new_records)
+                    item.total_amount = round(sum(record.total_amount for record in new_records), 2)
+                    item.category_totals = _category_totals(new_records)
+                    item.workbook_path = str(summary.workbook_path)
+                    item.detected_receipt_count = _detected_receipt_count(output_dir, Path(item.path))
+                    item.crop_count = item.detected_receipt_count
+                    review_reason = _source_review_reason(output_dir, Path(item.path))
+                    if summary.review_warnings:
+                        review_reason = "; ".join(filter(None, [review_reason, *summary.review_warnings]))
+                    item.needs_human_review = bool(review_reason)
+                    if review_reason:
+                        item.error = review_reason
+                    if after <= before and before > 0:
+                        item.error = "Already completed in processing checkpoint"
             except Exception as exc:
                 item.status = FAILED_RETRYABLE
                 item.error = str(exc).strip() or exc.__class__.__name__
@@ -609,9 +717,22 @@ def save_queue_state(path: Path, state: QueueState, preserve_concurrent: bool = 
         "rollback_blocked": state.rollback_blocked,
         "rollback_block_reason": state.rollback_block_reason,
     }
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        for attempt in range(5):
+            try:
+                temp.replace(path)
+                return
+            except PermissionError:
+                if attempt >= 4:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _load_processing_data(path: Path) -> dict:
@@ -802,6 +923,82 @@ def _detected_receipt_count(output_dir: Path, source_path: Path) -> int:
                 pass
         return max(counts, default=0)
     return 0
+
+
+def _source_review_reason(output_dir: Path, source_path: Path) -> str:
+    state_path = output_dir / "processing_state.json"
+    if not state_path.exists():
+        return ""
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    source_key = _path_key(source_path)
+    for item in reversed(data.get("source_qas", [])):
+        if not isinstance(item, dict):
+            continue
+        if _path_key(Path(str(item.get("source_image") or ""))) != source_key:
+            continue
+        if bool(item.get("needs_human_review")):
+            return str(item.get("reason") or "Human review required")
+        return ""
+    return ""
+
+
+def _source_transient_qwen_error(output_dir: Path, source_path: Path) -> str:
+    state_path = output_dir / "processing_state.json"
+    if not state_path.exists():
+        return ""
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    source_key = _path_key(source_path)
+    errors: list[str] = []
+    for audit in data.get("audits", []):
+        if not isinstance(audit, dict):
+            continue
+        if _path_key(Path(str(audit.get("source_image") or ""))) != source_key:
+            continue
+        error = str(audit.get("codex_error") or "")
+        if error:
+            errors.append(error)
+    if not errors:
+        return ""
+    transient_terms = ("http 429", "http 500", "http 502", "http 503", "http 504", "throttl", "serviceunavailable", "service unavailable")
+    return errors[0] if all(any(term in error.casefold() for term in transient_terms) for error in errors) else ""
+
+
+def _discard_source_results_for_retry(settings: Settings, user_id: int, output_dir: Path, source_path: Path) -> None:
+    processing_path = output_dir / "processing_state.json"
+    data = _load_processing_data(processing_path)
+    source_key = _path_key(source_path)
+    records = [record for record in data.get("records", []) if isinstance(record, dict)]
+    target_records = [record for record in records if _path_key(Path(str(record.get("source_image") or ""))) == source_key]
+    trace_ids = sorted({crop_id for record in target_records for crop_id in _crop_ids_from_processing_record(record)})
+    paths = [
+        path
+        for path in _rollback_paths_for_source(output_dir, source_path, data, target_records, trace_ids)
+        if _path_key(path) != source_key
+    ]
+    _remove_source_from_processing_data(data, source_path, _file_sha256(source_path))
+    reverse_review_sync_for_source(output_dir, source_path, set(trace_ids))
+    data["next_crop_id"] = _next_trace_after_rollback(output_dir, data)
+    _save_processing_data(processing_path, data)
+    rebuild_scan_output(output_dir, _processing_records(data), settings.pairing_mode)
+    _delete_paths(paths)
+
+
+def _processing_records(data: dict) -> list[InvoiceRecord]:
+    records: list[InvoiceRecord] = []
+    for value in data.get("records", []):
+        if not isinstance(value, dict):
+            continue
+        try:
+            records.append(InvoiceRecord(**value))
+        except TypeError:
+            continue
+    return records
 
 
 def _workbook_records_for_source(output_dir: Path, source_path: Path, workbook_records: list[InvoiceRecord]) -> list[InvoiceRecord]:
